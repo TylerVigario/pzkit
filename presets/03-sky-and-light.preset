@@ -1,0 +1,7 @@
+# HOLD IN RESERVE -- apply only after 01, one key at a time, re-benching between.
+# sky+light is the most expensive pass at 1.66 ms (29.8% of GPU time) and both of
+# these land in it, so this is the one preset that can actually cost fps.
+target: viewpoint
+
+pack.trueweathers.bounceLight=true
+pack.trueweathers.cloudSteps=30

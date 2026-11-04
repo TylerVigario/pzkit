@@ -1,0 +1,8 @@
+# The actual limiter. Of the 7.64 ms main frame, Viewpoint owns only 1.9 ms
+# (chunk cache 0.43 + far world 0.09 + snapshot 1.40); the other ~5.7 ms is the
+# base game's simulation, which no shader setting touches. These are the base-game
+# main-thread levers. Apply this SEPARATELY from 01 so the two are attributable.
+target: options
+
+maxActiveRagdolls=20
+uiRenderFPS=60

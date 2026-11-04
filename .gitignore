@@ -1,0 +1,6 @@
+# Timestamped config backups taken before each --apply. Local safety net, not history.
+/backups/*
+!/backups/.gitkeep
+
+__pycache__/
+*.pyc

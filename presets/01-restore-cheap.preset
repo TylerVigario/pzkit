@@ -1,0 +1,9 @@
+# Spend the GPU headroom. Measured 2026-11-04: GPU 5.77 ms median vs main thread
+# 7.64 ms, so ~1.87 ms of GPU work is free -- it cannot lower fps while the main
+# thread is the limiter. Every key here lives in a pass costing under 0.5 ms.
+target: viewpoint
+
+pack.trueweathers.lensFlare=true
+pack.trueweathers.farShadows=true
+pack.trueweathers.headlightShadows=1
+pack.trueweathers.occlusionQuality=medium
