@@ -100,11 +100,27 @@ def split_warmup(samples):
     return warm, steady
 
 
+def pct(vals, p):
+    if not vals:
+        return 0.0
+    v = sorted(vals)
+    i = min(len(v) - 1, max(0, int(round(p * (len(v) - 1)))))
+    return v[i]
+
+
 def stat(vals):
     if not vals:
         return (0.0, 0.0, 0.0)
     v = sorted(vals)
     return (statistics.median(v), v[int(len(v) * 0.95) - 1] if len(v) > 1 else v[0], max(v))
+
+
+def spread(samples):
+    """The p10-p90 band of main frame time, in ms. This is the noise floor: any
+    change smaller than it cannot be resolved by a single run, so it has to be
+    reported alongside every delta or the delta is meaningless."""
+    f = [s["frame_ms"] for s in samples]
+    return pct(f, 0.10), pct(f, 0.90)
 
 
 def profile(path):
@@ -136,11 +152,22 @@ def report(p):
     fps_gpu = f"-> {1000/gmed:.0f} fps if GPU-bound" if gmed > 0 else "-> no GPU timings"
     print(f"  {'main frame ms':<14}{fmed:>10.2f}{f95:>10.2f}{fmax:>10.2f}   {fps_main}")
     print(f"  {'gpu ms':<14}{gmed:>10.2f}{g95:>10.2f}{gmax:>10.2f}   {fps_gpu}")
+    lo, hi = spread(steady)
+    band = hi - lo
+    fps_lo, fps_hi = (1000 / hi if hi else 0), (1000 / lo if lo else 0)
+    print(f"\n  NOISE FLOOR: p10-p90 frame time {lo:.2f}-{hi:.2f} ms"
+          f"  ({band:.2f} ms band, {fps_lo:.0f}-{fps_hi:.0f} fps)")
+
     if gmed > 0:
         limiter = "MAIN THREAD" if fmed > gmed else "GPU"
-        print(f"\n  LIMITER: {limiter}   (headroom on the other side: {abs(fmed-gmed):.2f} ms)")
+        head = abs(fmed - gmed)
+        print(f"  LIMITER: {limiter}   (headroom on the other side: {head:.2f} ms)")
         if limiter == "MAIN THREAD":
             print("  -> GPU-side quality cuts buy no fps here. Spend the headroom instead.")
+        if head < band:
+            print(f"  !! the {head:.2f} ms headroom is SMALLER than the {band:.2f} ms noise band.")
+            print("     A single run cannot resolve a change this size. Either control the")
+            print("     scene harder (stand still, same spot) or judge it by eye, not by fps.")
 
     print(f"\n  per-pass GPU ms (median), most expensive first:")
     tot = sum(statistics.median([s["gpu"][x] for s in steady]) for x in PASSES) or 1.0
@@ -204,8 +231,22 @@ def compare(a, b):
                       ("gpu ms", lambda x: x["gpu_total"]),
                       ("fps", lambda x: x["fps"])):
         va, vb = med(sa, fn), med(sb, fn)
-        pct = (vb - va) / va * 100 if va else 0
-        print(f"  {label:<14}{va:>10.2f}{vb:>10.2f}{pct:>11.1f}%")
+        delta = (vb - va) / va * 100 if va else 0
+        print(f"  {label:<14}{va:>10.2f}{vb:>10.2f}{delta:>11.1f}%")
+
+    # A delta smaller than either run's own noise band is not a result.
+    la, ha = spread(sa)
+    lb, hb = spread(sb)
+    worst_band = max(ha - la, hb - lb)
+    moved = abs(med(sb, lambda x: x["frame_ms"]) - med(sa, lambda x: x["frame_ms"]))
+    print(f"\n  frame-time change {moved:.2f} ms against a noise band of "
+          f"{worst_band:.2f} ms")
+    if moved < worst_band:
+        print("  !! NOT A RESULT. The change is inside the run-to-run spread -- this")
+        print("     comparison cannot tell you which config is faster. Control the scene")
+        print("     (stand still, same spot, same in-game time) and run both again.")
+    else:
+        print("  -> outside the noise band, so this is a real difference.")
 
     print(f"\n  per-pass GPU ms change (biggest saving first):")
     rows = []
