@@ -120,6 +120,35 @@ Kept because the wrong version is instructive.
 
 Runs are only comparable if the scene is. Weather alone swings `sky+light` hard.
 
+### Step zero: measure the noise floor, before tuning anything
+
+**Measured 2026-11-04 and this is the binding constraint on the whole method.** The
+first run's own p10–p90 band was **1.46 ms (121–147 fps)**, against the 1.87 ms of GPU
+headroom it was meant to help spend. A **1.3:1 signal-to-noise ratio** — so only a
+change that spends most of the headroom is resolvable in a single run, and anything
+incremental is not.
+
+Weather was near-constant throughout that run (day 0.85–0.92, rain 0.00, cover 0.80),
+so **scene composition was the entire variance source** — the run was uncontrolled
+play, with zombie count, buildings and light sources changing shot to shot.
+
+So before any A/B:
+
+- **Run A** — current config, stand still in one spot in first person, 3+ minutes.
+- **Run B** — change *nothing*. Same spot, same in-game time. 3 minutes again.
+- `python pzbench.py <A> <B>` — an identical config run twice gives the true floor.
+
+If the controlled band falls to ~0.3 ms, single settings become measurable and the
+loop below works. If it does not, **fps is the wrong instrument and settings should be
+judged by eye.**
+
+> **Corollary: do not bench what is permanently under the floor.** `01-restore-cheap`
+> is ~0.5 ms. No achievable noise floor resolves it, and the question it answers is
+> "do the lens flares and far shadows look better", which is a matter for the eye.
+> Benching it would produce a number that could not be trusted.
+
+### The loop
+
 1. `python pzpreset.py --snapshot my-baseline` — always have a way back.
 2. `--diff` the preset, then `--apply` it. **Game must be closed.**
 3. Launch, go to the *same* spot, same in-game time and weather, enter first person.
@@ -164,7 +193,15 @@ intended lines and nothing else. Not yet benched.
 
 ## Open
 
-- **Bench `01` and `02`** — applied, unmeasured.
+- **The controlled noise floor is unmeasured.** Step zero above. Everything else waits
+  on it — six minutes of standing still.
+- **`02-mainthread` is applied and unmeasured**, and is worth benching: it plausibly
+  moves more than the 1.46 ms band. **`01-restore-cheap` is applied and should not be
+  benched** — judge it by eye.
+- **No clean before/after exists for `01`/`02`.** They were applied immediately after
+  the only profiled run, so the pre-change state was never captured under control.
+  Recoverable with `--apply 00-baseline-viewpoint` / `00-baseline-options` if a true A
+  is ever wanted; probably not worth it.
 - **25 slow main-thread frames per 25 min, worst 319 ms.** Well clear of a hang now,
   but a visible hitch. Suspected new shader variants compiling as weather and time
   change; should fade as the cache fills. Unconfirmed.
