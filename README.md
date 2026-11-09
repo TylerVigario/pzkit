@@ -285,12 +285,17 @@ intended lines and nothing else. Not yet benched.
 
 In priority order, and the first one is now well ahead of the rest.
 
-1. **`-Xmx3072m` → `6144m`** in `ProjectZomboid64.json`. The hour-4 table is the case:
-   21 GC cycles per 10 s against 3 when fresh, heap pinned at the ceiling, on a host
-   where the main thread is the limiter. Not yet applied. Note Viewpoint manages that
-   file (it keeps a `.viewpoint-backup`) and swapped the collector ZGC → Shenandoah;
-   **change `-Xmx` only, leave the collector alone**, it is behaving. Verified by
-   playing to hour 3+ and reading the cycle rate, not by a 4-minute run.
+1. **`-Xmx3072m` → `6144m`** — **applied 2026-11-09**, backed up to
+   `ProjectZomboid64.json.pretune-2026-11-09T090752`, JSON re-validated, game closed
+   at the time. The hour-4 table is the case: 21 GC cycles per 10 s against 3 when
+   fresh, heap pinned at the ceiling, on a host where the main thread is the limiter.
+   Only `-Xmx` was touched — Viewpoint manages that file (it keeps a
+   `.viewpoint-backup`) and swapped the collector ZGC → Shenandoah; **the collector
+   was left alone**, it is behaving. **Unverified.** The test is to play to hour 3+
+   and read the cycle rate off the stat line; a 4-minute run cannot see it, because
+   the problem only exists once the heap has filled. If Viewpoint or a Steam file
+   verification rewrites the file, this reverts silently — re-check the value before
+   concluding the change did nothing.
 2. **Bench `02-mainthread`** (applied 2026-11-04, never measured). Main-thread side, so
    it can actually move the limiter. Use the 4–5 minute protocol.
 3. **Then spend the GPU headroom**, ~1.4 ms of it, one key at a time — `03-sky-and-light`
