@@ -11,6 +11,7 @@ every few seconds. These two scripts turn that into a benchmark loop.
 ```
 python pzbench.py  <DebugLog.txt> [<DebugLog.txt> ...]   # profile, and compare runs
 python pzpreset.py --list | --diff P | --apply P         # change settings reproducibly
+python pztail.py   [--console]                           # keep a log the game would wipe
 ```
 
 Started 2026-11-04 after two `AppHangB1` hangs entering first person. No remote, per
@@ -242,12 +243,53 @@ Logs live in `~/Zomboid/Logs/`. Two traps, both of which have already cost time:
 
 - PZ **rotates the previous run** into `Logs/logs_<timestamp>/` on launch, so the log
   you want is usually in a subfolder, not loose in `Logs/`.
-- **`DebugLog.txt` is truncated, not appended indefinitely.** The 3h58m session of
-  2026-11-04 15:23 left a 230 KB file of **214 lines**, beginning mid-session at
-  19:15:17 with frame counter `f:1619662`. A 4-minute run leaves 1.4 MB. So a long
-  session yields only its last few minutes of telemetry. That is still the most
-  valuable few minutes — it shows the state *after* hours of play — but there is no
-  way to see the trajectory that got there, and nothing warns you.
+- **PZ wipes its own log at ~10 MB, mid-session, with no backup.** Not rotation.
+  Read out of `zombie/core/logger/ZLogger` in `projectzomboid.jar` (42.21.0):
+
+  ```java
+  static final long s_maxSizeKo = 10000;
+
+  void checkSizeUnsafe() {
+      if (this.file.length() / 1024L > s_maxSizeKo) recreateLogFileUnsafe();
+  }
+  void recreateLogFileUnsafe() {
+      this.outputStreams.file.close();
+      this.file = new File(LoggerManager.getLogFilePath(this.name));
+      this.outputStreams.file = new PrintStream(this.file);   // truncates
+  }
+  ```
+
+  It fires at **10,241,024 bytes** exactly — integer division, so the first length
+  whose `length/1024` exceeds 10000 — then reopens a `PrintStream` on the *same
+  path*, which truncates it. Everything written earlier is destroyed while the game
+  is still running. The 3h58m session of 2026-11-04 15:23 left 214 lines covering its
+  last 6m20s; the first 3h52m were gone.
+
+  **There is nothing to configure.** `s_maxSizeKo` is `static final` — a compile-time
+  constant, with no system property, no launch flag and no `debuglog.cfg` key behind
+  it. `console.txt` is a separate `ZLogger` with its own 10 MB budget, so it wipes at
+  a different moment and by luck covered 811 stat lines of that session against
+  DebugLog's 39 — useful, but not a fix.
+
+  **Cutting log volume is not a way out either.** In steady state **82% of the bytes
+  are Viewpoint's own stat line** — 4.8 KB per sample, which is exactly the data
+  worth keeping. Silencing every other channel buys 18%, moving the cap from 4.7 to
+  5.7 hours, and Viewpoint has no key to trim the line (all 566 checked).
+
+  So **`pztail.py` copies the bytes out as they are written** and survives the
+  truncate. Run it before a long session:
+
+  ```
+  python pztail.py              # follow the live log, Ctrl-C to stop
+  python pztail.py --console    # also follow console.txt
+  python pztail.py --once       # one catch-up pass over what is there now
+  ```
+
+  Captures are append-only in `captures/`, and `pzbench.py` reads them directly. The
+  truncate detection is tested two ways — a plain truncate, and a truncate that
+  refills *past* the old offset inside one poll interval, which a size comparison
+  alone would miss and append into the middle of a fresh file. A 256-byte anchor
+  check catches that one.
 
 `pzbench.py` separates **pipeline-build** frames from **steady state** on purpose. The
 frame that hung the game was a build frame of 2,678 ms; folding that into a median

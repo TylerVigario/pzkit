@@ -4,3 +4,8 @@
 
 __pycache__/
 *.pyc
+
+# Captured logs. Multi-megabyte game output, reproducible by re-running; the
+# analysis belongs in history, the raw bytes do not.
+/captures/*
+!/captures/.gitkeep
