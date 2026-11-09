@@ -82,22 +82,63 @@ def parse(path):
 
 
 def split_warmup(samples):
-    """Steady state = samples after the pipeline settles. A 0-fps sample, or one
-    whose render CPU is an order of magnitude over the median, is construction."""
+    """Split a run into pipeline-build, warmup ramp, and steady state.
+
+    There are TWO warmup effects and conflating them wrecked the first round of
+    measurement here. Measured 2026-11-04 on two identical 2-minute runs:
+
+      build  one sample, render CPU 3294 ms -- the deferred pipeline being
+             constructed on entry to first person. Obvious, already caught.
+      ramp   the NEXT ~90 seconds. Frame time falls monotonically
+             8.37 -> 8.05 -> 7.69 -> 7.49 -> 7.38 -> 7.22 and then plateaus,
+             with render CPU falling 13.5 -> 5.6 -> 5.4 -> 5.3 alongside it.
+             This is NOT noise, it is a settling curve, and it was inflating
+             the reported p10-p90 band from 0.17 ms to 1.16 ms -- an eightfold
+             overstatement of the noise floor, which made real changes look
+             unmeasurable.
+
+    So: drop the build samples, then drop leading samples until frame time
+    stops sitting above the plateau. The plateau is taken from the back half of
+    what is left, which is the part that is definitionally settled.
+    """
     if not samples:
-        return [], []
+        return [], [], []
     cpu = sorted(s["cpu_total"] for s in samples)
     med = cpu[len(cpu) // 2]
-    warm, steady = [], []
+    build, rest = [], []
     for s in samples:
         # fps 0 or gpu_total 0 means the frame never completed -- the GPU timers
         # report nothing, so the sample is a stall, not a measurement.
         stalled = s["fps"] == 0 or s["gpu_total"] <= 0.0
         if stalled or s["cpu_total"] > max(10 * med, 100.0):
-            warm.append(s)
+            build.append(s)
         else:
-            steady.append(s)
-    return warm, steady
+            rest.append(s)
+
+    if len(rest) < 6:
+        return build, [], rest  # too short to tell a ramp from the plateau
+
+    half = len(rest) // 2
+    ceiling = pct([s["frame_ms"] for s in rest[half:]], 0.90)
+
+    # Cut to the LAST sample in the first half that is still above the plateau,
+    # not the first one that dips below it. A settling run is not monotone -- it
+    # bounces on the way down -- and stopping at the first dip leaves most of
+    # the ramp in place. That asymmetry measured two identical runs over
+    # different windows and manufactured a 0.15 ms difference between them.
+    cut = 0
+    for i in range(half):
+        if rest[i]["frame_ms"] > ceiling:
+            cut = i + 1
+
+    # A ramp has to actually DESCEND. Without this guard the rule happily
+    # trimmed 19 of 39 samples off a mid-session play log whose leading samples
+    # were simply a busier scene -- a prefix running 8.33 -> 12.78 ms, trimmed
+    # as "warmup". That is not settling, it is cherry-picking the quiet half,
+    # and it moved the reported median by 0.5 ms in the flattering direction.
+    if cut > 1 and rest[0]["frame_ms"] <= rest[cut - 1]["frame_ms"]:
+        cut = 0
+    return build, rest[:cut], rest[cut:]
 
 
 def pct(vals, p):
@@ -116,33 +157,62 @@ def stat(vals):
 
 
 def spread(samples):
-    """The p10-p90 band of main frame time, in ms. This is the noise floor: any
-    change smaller than it cannot be resolved by a single run, so it has to be
-    reported alongside every delta or the delta is meaningless."""
+    """The p10-p90 band of main frame time, in ms -- how much one SAMPLE varies.
+
+    This is not the resolving power of the benchmark. See resolution(): the
+    comparison is between medians, and a median of n samples is far steadier
+    than a single sample. Comparing a median delta against this band was the
+    original mistake here and it declared a real 0.5 ms change unmeasurable."""
     f = [s["frame_ms"] for s in samples]
     return pct(f, 0.10), pct(f, 0.90)
 
 
+def resolution(samples):
+    """Smallest median shift this run can actually resolve, in ms.
+
+    band/sqrt(n), which is roughly a 2-sigma threshold on the median:
+    p10-p90 spans ~2.56 sigma, and the standard error of a median is
+    ~1.25*sigma/sqrt(n), so band/sqrt(n) ~= 2.05 * SE. Deliberately the
+    conservative side of exact.
+
+    Checked against reality: two identical controlled runs, n=6 each, bands
+    0.17 and 0.45 ms -> resolution 0.18 ms. Their medians came out 7.22 and
+    7.24 ms, 0.02 ms apart. The threshold holds, and it puts a 0.5 ms change
+    comfortably inside reach."""
+    lo, hi = spread(samples)
+    n = max(len(samples), 1)
+    return (hi - lo) / (n ** 0.5)
+
+
 def profile(path):
     samples, slow_main, slow_render = parse(path)
-    warm, steady = split_warmup(samples)
+    build, ramp, steady = split_warmup(samples)
     return {
         "path": Path(path).name,
-        "samples": len(samples), "warm": len(warm), "steady": len(steady),
-        "steady": steady, "warmup": warm,
+        "samples": len(samples),
+        "steady": steady, "warmup": build, "ramp": ramp,
         "slow_main": slow_main, "slow_render": slow_render,
     }
 
 
 def report(p):
-    steady, warm = p["steady"], p["warmup"]
+    steady, warm, ramp = p["steady"], p["warmup"], p["ramp"]
     print("=" * 78)
     print(p["path"])
     print("=" * 78)
-    print(f"  stat samples {p['samples']}  (steady {len(steady)}, pipeline-build {len(warm)})")
+    print(f"  stat samples {p['samples']}  (steady {len(steady)}, "
+          f"warmup ramp {len(ramp)}, pipeline-build {len(warm)})")
     if not steady:
         print("  no steady-state samples -- the run never settled.")
         return
+    if ramp:
+        shape = (f"{ramp[0]['frame_ms']:.2f} -> {ramp[-1]['frame_ms']:.2f} ms"
+                 if len(ramp) > 1 else f"{ramp[0]['frame_ms']:.2f} ms")
+        print(f"  discarded a {len(ramp) * 10}s warmup ramp ({shape})."
+              f"  Measure AFTER it, not through it.")
+    if len(steady) < 12:
+        print(f"  !! only {len(steady)} settled samples (~{len(steady) * 10}s). Stand still")
+        print("     longer -- resolving power improves as sqrt(n).")
 
     fmed, f95, fmax = stat([s["frame_ms"] for s in steady])
     gmed, g95, gmax = stat([s["gpu_total"] for s in steady])
@@ -154,9 +224,11 @@ def report(p):
     print(f"  {'gpu ms':<14}{gmed:>10.2f}{g95:>10.2f}{gmax:>10.2f}   {fps_gpu}")
     lo, hi = spread(steady)
     band = hi - lo
+    res = resolution(steady)
     fps_lo, fps_hi = (1000 / hi if hi else 0), (1000 / lo if lo else 0)
-    print(f"\n  NOISE FLOOR: p10-p90 frame time {lo:.2f}-{hi:.2f} ms"
+    print(f"\n  sample spread: p10-p90 frame time {lo:.2f}-{hi:.2f} ms"
           f"  ({band:.2f} ms band, {fps_lo:.0f}-{fps_hi:.0f} fps)")
+    print(f"  RESOLUTION: {res:.2f} ms  -- the smallest median shift n={len(steady)} can show")
 
     if gmed > 0:
         limiter = "MAIN THREAD" if fmed > gmed else "GPU"
@@ -164,10 +236,11 @@ def report(p):
         print(f"  LIMITER: {limiter}   (headroom on the other side: {head:.2f} ms)")
         if limiter == "MAIN THREAD":
             print("  -> GPU-side quality cuts buy no fps here. Spend the headroom instead.")
-        if head < band:
-            print(f"  !! the {head:.2f} ms headroom is SMALLER than the {band:.2f} ms noise band.")
-            print("     A single run cannot resolve a change this size. Either control the")
-            print("     scene harder (stand still, same spot) or judge it by eye, not by fps.")
+        if head < res:
+            print(f"  !! the {head:.2f} ms headroom is below the {res:.2f} ms resolution.")
+            print("     Nothing on the GPU side is worth benching -- judge it by eye.")
+        else:
+            print(f"  -> headroom is {head / res:.1f}x the resolution, so spending it is measurable.")
 
     print(f"\n  per-pass GPU ms (median), most expensive first:")
     tot = sum(statistics.median([s["gpu"][x] for s in steady]) for x in PASSES) or 1.0
@@ -234,19 +307,18 @@ def compare(a, b):
         delta = (vb - va) / va * 100 if va else 0
         print(f"  {label:<14}{va:>10.2f}{vb:>10.2f}{delta:>11.1f}%")
 
-    # A delta smaller than either run's own noise band is not a result.
-    la, ha = spread(sa)
-    lb, hb = spread(sb)
-    worst_band = max(ha - la, hb - lb)
+    # The comparison is between MEDIANS, so the threshold is the resolution of
+    # the weaker run, not its sample spread. Using the spread here was wrong and
+    # too strict by a factor of sqrt(n) -- see resolution().
+    res = max(resolution(sa), resolution(sb))
     moved = abs(med(sb, lambda x: x["frame_ms"]) - med(sa, lambda x: x["frame_ms"]))
-    print(f"\n  frame-time change {moved:.2f} ms against a noise band of "
-          f"{worst_band:.2f} ms")
-    if moved < worst_band:
-        print("  !! NOT A RESULT. The change is inside the run-to-run spread -- this")
-        print("     comparison cannot tell you which config is faster. Control the scene")
-        print("     (stand still, same spot, same in-game time) and run both again.")
+    print(f"\n  frame-time change {moved:.2f} ms against a resolution of {res:.2f} ms")
+    if moved < res:
+        print("  !! NOT A RESULT. The shift is below what these runs can resolve. Either")
+        print("     the change does nothing, or you need longer runs (resolution improves")
+        print("     as sqrt(n)) or a harder-controlled scene.")
     else:
-        print("  -> outside the noise band, so this is a real difference.")
+        print(f"  -> {moved / res:.1f}x the resolution, so this is a real difference.")
 
     print(f"\n  per-pass GPU ms change (biggest saving first):")
     rows = []
