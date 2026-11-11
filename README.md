@@ -196,6 +196,88 @@ is the mod's own work, a small `ours` with a large remainder is the game re-uplo
 the renderer, or the server. Reading the median instead of the attribution is what kept
 this confused for a week.
 
+## The passenger stop-and-shake, and the curve underneath it
+
+Tyler reported for weeks that the car does a "stop and shake" when he rides as a
+passenger. It was diagnosed 2026-11-11 and it is **not a network problem**, which is
+where everyone looks first.
+
+**The question that cracked it was "is there rubber banding?" and the answer was no.**
+A car whose authoritative position arrives late snaps to a corrected place when it
+catches up. This one freezes and resumes from the same spot. That rules out position
+correction entirely, and it points at a local freeze — which is what the client log had
+been recording all along as `slow frame on the main thread`.
+
+**The stalls scale with session progress.** 23 steady-state stalls over 32 minutes,
+0.66/min:
+
+| | median stall |
+|---|---|
+| first 10 minutes | **88 ms** |
+| after 20 minutes | **253 ms** |
+
+Spearman rho against stall size: `remembered chunks` +0.599, `map layouts` +0.599,
+`elapsed minutes` +0.599 — and `chunks` against `elapsed` is **+1.000**. In a session
+spent travelling continuously those three are one curve, so **explored area and elapsed
+time cannot be told apart here.** That is a limit of the data, not a hedge.
+
+**The discriminating run is to stand still for ~30 minutes**, where time advances and
+area does not. Stalls still climbing to 250 ms means something time-based; stalls holding
+near 88 ms means explored area, and the fix is in what gets retained. Not yet done.
+
+**Ruled out, both ends.** The host lane ran the server-side exclusions:
+
+| suspect | how it was cleared |
+|---|---|
+| server hitches ≥500 ms | **0 of 21** stall windows overlap any of 54 logged 13:49–14:22 |
+| server GC | first young GC after a 10,711 → 2,535 MiB climb paused **54.5 ms**, about half a tick |
+| server safepoints | 27 totalling 90.4 s, but the count did not move across five per-minute samples during play — startup, not play |
+| driver frame rate | host went from 30 fps (frame generation) to a real 60; symptom "roughly the same" |
+| client GC | cycles median 0, pause max 2 ms, heap median 3,601 MiB and **flat across the session at −1%** |
+| chunk building | 0.15 ms per build, `waiting in view` 0; the 9 ms main-thread budget is never touched |
+| Viewpoint's rendering | it attributes **0.8–2.2 ms** of each 200–290 ms stall to itself |
+| mod Lua errors | all 12 at load (13:49:06), from a music mod, none during play |
+
+**And nothing Viewpoint reports spikes at the moment of a stall.** Counter ratios in
+stall windows against all others run 1.00–1.13 across chunks, map lamps, light-main,
+band grids, room levels, compile, select, snapshot, cache, heap and committed. The work
+is in the base game's Java and it is invisible to every instrument here. **There is no
+client-side Lua profiler** — the host's returns at `if not isServer()` by design — so
+client mod cost is currently unmeasurable, which is the obvious gap to close next.
+
+GPU-memory eviction explains **5 of 21** at ×10 chance, so it is a real but partial
+contributor and cannot carry a curve that triples.
+
+**The workaround, until there is a fix:** a client restart resets it. The first ten
+minutes are at 88 ms, which is barely perceptible.
+
+## Three ways a counter lied, all on the same day
+
+All three produced a confident wrong answer that survived until something else
+contradicted it.
+
+**An eviction counter that resets.** `evictions N (M MiB)` in the stat line is a
+per-window count, not a running total, so reading its maximum gives the biggest single
+window rather than the session. Summing the deltas: **13 events** in the 13-47 session,
+where `max()` said 4. The morning session is 14, not 3. Every eviction rate quoted from a
+maximum is low by roughly a factor of three.
+
+**`st:` is not a wall clock.** The console lines carry `st:` where the DebugLog carries a
+timestamp, and solving one against the other looks like it should date the console
+warnings. It does not: `st` resets to 0, and the regression gives a 23,000-second spread
+over 6,174 anchors. Any time derived that way is fiction.
+
+**A clock skew needs one reference, not two readings.** Reading each machine's clock and
+subtracting measures the gap between two *moments*, not between two clocks.
+`w32tm /stripchart /computer:time.windows.com /samples:4 /dataonly` on both, same server,
+same convention, does measure it: this machine +1.2696 s, the host +0.331 s, so
+
+    client − host = −0.939 s        host_time = client_time + 0.939 s
+
+steady to half a millisecond over four samples. That killed a live hypothesis: a ~4 s
+skew would have made a 963 ms server hitch cover two client stalls, and at 0.939 s the
+nearest server hitch starts **1.59 s after the client stall ends**.
+
 ## Two index conventions in one options file
 
 `options.ini` stores the graphics quality settings two different ways, and both read as
