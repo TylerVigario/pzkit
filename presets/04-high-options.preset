@@ -1,0 +1,26 @@
+# The only vanilla graphics option on this machine that is actually turned down.
+#
+# Everything else in options.ini's graphics block is already at maximum, which is
+# not obvious from reading it, because two different index conventions sit in the
+# same file:
+#
+#   water / puddles / perfPuddles / fogQuality / perfSkybox
+#       stored as COMBO INDEX, 0-based. MainOptions.lua does
+#       `box.selected = get...() + 1` and `set...(box.selected - 1)`, and the
+#       first entry of each combo is the BEST one -- {High, Medium, Low},
+#       {All, GroundWithRuts, GroundOnly, None}. So 0 means High, or All.
+#
+#   maxTextureSize / maxVehicleTextureSize
+#       stored 1-BASED with no offset at all: `box.selected = get...()`,
+#       `set...(box.selected)`. So 4 means the fourth and largest entry.
+#
+# Both read as "at maximum" and they get there by opposite arithmetic. Reading a
+# 0 as "off" is the easy mistake and it inverts the whole conclusion about where
+# the GPU headroom can be spent.
+#
+# bPerfReflections is a plain yes/no bound straight to getPerfReflections(), no
+# index involved, and it is false. Turning it on requires a restart -- the option
+# screen calls restartRequired() when it changes.
+target: options
+
+bPerfReflections=true

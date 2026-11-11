@@ -196,6 +196,30 @@ is the mod's own work, a small `ours` with a large remainder is the game re-uplo
 the renderer, or the server. Reading the median instead of the attribution is what kept
 this confused for a week.
 
+## Two index conventions in one options file
+
+`options.ini` stores the graphics quality settings two different ways, and both read as
+"at maximum" by opposite arithmetic. Verified 2026-11-11 against
+`media/lua/client/OptionScreens/MainOptions.lua`.
+
+| key | stored as | value here | means |
+|---|---|---|---|
+| `water` | combo index, `selected = v + 1` | `0` | **High** of {High, Medium, Low} |
+| `puddles` | same | `0` | **High** |
+| `perfPuddles` | same | `0` | **All** of {All, GroundWithRuts, GroundOnly, None} |
+| `fogQuality` | same | `0` | **High** of {High, Medium, legacy} |
+| `perfSkybox` | same | `0` | **High** of {High, Medium, No} |
+| `maxTextureSize` | 1-based, **no offset**: `selected = v` | `4` | **largest** of four |
+| `maxVehicleTextureSize` | same | `4` | **largest** |
+| `bPerfReflections` | plain bool, no index | `false` | **off** |
+
+The first group applies with `set…(box.selected - 1)` and the first combo entry is the
+best one, so a `0` is the *highest* setting. The second group applies with
+`set…(box.selected)` and no arithmetic at all, so a `4` is also the highest. Reading a
+`0` as "off" inverts the conclusion about where GPU headroom can be spent: it puts the
+floor in `options.ini`, where there is none, instead of in Viewpoint's shader pack,
+where 13 of 68 keys really are `false`.
+
 ## Things measured and then found wrong
 
 Kept because the wrong version is instructive.
@@ -501,27 +525,52 @@ In priority order.
    against a capped frame time divides one clamped number by another and means nothing,
    however large it comes out.
 
-   Every GPU quality lever is at its floor: `fogQuality=0`, `perfSkybox=0`,
-   `perfPuddles=0`, `puddles=0`, `water=0`, `bPerfReflections=false`. So the only move is
-   upward, and **this needs no A/B at all** — the stat line attributes GPU ms per pass,
-   so one run at high settings prices every feature at once. Per-pass costs are GPU timer
-   queries and stay valid under a cap, which makes this the one open item that could have
-   been worked the whole time. Top passes measured: `gbuffer` 1.29 ms (28.5%),
-   `sky+light` 1.10 ms (24.2%), `post+taa` 0.59 ms; `air`, `weather` and `outlines` sit
-   at 0.00 ms.
+   **The vanilla options cannot spend it — they are already at maximum.** See
+   *Two index conventions in one options file* below; the 0s in `options.ini` mean High,
+   not off. The one vanilla graphics option genuinely turned down is
+   `bPerfReflections=false`.
 
-   **Do item 3 first.** Raising quality raises VRAM, and VRAM eviction is the measured
-   stall source — a high-settings run taken before the competitors are gone confounds a
-   GPU measurement with a memory one.
+   **Viewpoint's shader pack is where the floor actually is.** 13 of its 68
+   `pack.trueweathers.*` keys are `false`, and all six keys that `01-restore-cheap` and
+   `03-sky-and-light` target still hold their 2026-11-04 baseline values — so
+   `01-restore-cheap` was written and never applied, and the headroom has never been
+   spent at all.
+
+   **This needs no A/B** — the stat line attributes GPU ms per pass, so one run prices
+   every feature at once. Per-pass costs are GPU timer queries and stay valid under a cap,
+   which makes this the one open item that could have been worked the whole time. Top
+   passes measured: `gbuffer` 1.29 ms (28.5%), `sky+light` 1.10 ms (24.2%), `post+taa`
+   0.59 ms; `air`, `weather` and `outlines` sit at 0.00 ms. **A key does not necessarily
+   map to the pass that shares its name**: the `occlusion` pass already costs 0.45 ms
+   while `pack.trueweathers.occlusion` is `false`, so that pass is the base pack's own
+   work.
+
+   `04-high-viewpoint` + `04-high-options` go deliberately over budget — fidelity keys on,
+   taste keys (`motionBlur`, `filmGrain`, `depthOfField`, `nebula`, `fftWaves`) left off —
+   so the per-pass table can be read and then scaled down. Going high first is the method:
+   cost is only attributable to a setting that is actually costing something, whereas from
+   the floor every addition reads as zero until the budget is crossed and then they all
+   read at once.
+
+   One unverified value in that preset: `occlusionQuality=medium`. `low` is live and
+   `medium` is carried from `01-restore-cheap`, but the accepted set is not documented in
+   any file on disk. If the occlusion pass does not move, suspect a rejected value before
+   suspecting the setting.
 3. **Reduce what competes for the GPU memory budget.** Measured 2026-11-11 during play:
    PZ holds 3,933 MB and **other processes hold 3,005 MB** — `dwm` 1,735 MB, then
    Steam/Epic/Battle.net/Samsung Magician/Edge/Code/terminals. Evictions fire across
    **45–76% card occupancy, median 67%** (8,262 of 12,282 MiB) because Windows sizes each
    process's budget against the others, not because 12 GB is full. Quote the range or
    the median, not the low end — at 45% occupancy the card looks almost empty, which
-   makes the budget mechanism sound stranger than it is. Closing Epic (2 processes), Battle.net and Samsung Magician
-   frees ~490 MB and three competitors. Test it against the measured baseline of
-   **0.21–0.32 eviction events per minute**.
+   makes the budget mechanism sound stranger than it is.
+
+   **Ruled out 2026-11-11 on Tyler's call, and the arithmetic agrees.** The available
+   win is ~490 MB against roughly 4 GB of headroom, about 12%, in exchange for changing
+   how the machine gets used while playing. That is not a trade worth making, and a
+   tuning lever that requires closing the launchers you actually use is not a lever. The
+   eviction-stall problem stands open; this was the wrong instrument for it. The baseline
+   of **0.21–0.32 eviction events per minute** remains the number any future attempt
+   measures against.
 4. **`textureCompression=true` — keep it, deliberately.** It arrived as residue, not a
    decision: the pre-PZO value was `false`, MPOptimizer enforced `Enabled` mid-session on
    2026-11-11 at 09:43, and the change outlived the mod. But compression lowers VRAM

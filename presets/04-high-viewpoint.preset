@@ -1,0 +1,41 @@
+# Go over budget deliberately, then scale down from the per-pass table.
+#
+# The vanilla graphics options cannot do this: they are already at maximum.
+# options.ini stores water/puddles/perfPuddles/fogQuality/perfSkybox as the
+# COMBO INDEX, and the first entry of each combo is the best one, so the 0s
+# there mean High/High/All/High/High, not off. The only vanilla quality item
+# actually disabled is bPerfReflections -- see 04-high-options.
+#
+# So the GPU headroom can only be spent here, in Viewpoint's shader pack, which
+# is genuinely at its floor: 13 of the 68 pack.trueweathers.* keys are false and
+# all six keys the earlier presets target still hold their 2026-11-04 baseline
+# values, so 01-restore-cheap was never actually applied.
+#
+# This turns on the FIDELITY keys and deliberately leaves the TASTE keys alone
+# (motionBlur, filmGrain, depthOfField, nebula, fftWaves stay false -- they are
+# look choices, not quality, and turning them on would price effects nobody
+# wants). Expect this to cost fps. That is the point: cost is only attributable
+# to a setting that is actually costing something, which is why this goes high
+# first and comes down afterwards rather than creeping up from the floor.
+#
+# occlusionQuality=medium is the one UNVERIFIED value here. "low" is what is
+# live and "medium" is carried over from 01-restore-cheap, but the mod's accepted
+# set is not documented in any file on disk. If the bench shows the occlusion
+# pass unmoved, suspect the value was rejected before suspecting the setting.
+#
+# Do not assume a key maps to the pass that shares its name. The occlusion pass
+# already costs 0.45 ms while pack.trueweathers.occlusion is false, so that pass
+# is something else -- the base pack's own work.
+target: viewpoint
+
+pack.trueweathers.bounceLight=true
+pack.trueweathers.cloudReflections=true
+pack.trueweathers.cloudSteps=30
+pack.trueweathers.farShadows=true
+pack.trueweathers.godrays=true
+pack.trueweathers.headlightShadows=1
+pack.trueweathers.lensFlare=true
+pack.trueweathers.occlusion=true
+pack.trueweathers.occlusionQuality=medium
+pack.trueweathers.sunShafts=true
+pack.trueweathers.volumetrics=true
