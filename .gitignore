@@ -17,3 +17,4 @@ __pycache__/
 /reports/*
 !/reports/.gitkeep
 !/reports/INDEX.md
+captures/*_process.csv
