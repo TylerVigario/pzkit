@@ -206,10 +206,29 @@ def cap(samples):
         return None
     on_floor = sum(1 for x in f if x <= floor * 1.004)   # a single 0.4% bucket
     share = on_floor / len(f)
-    # Both conditions are load-bearing. A floor that few samples reach is just
-    # the fast end of a real distribution, and a median well above the floor
-    # means the run spent its time off the cap, so the cap is not the limiter.
-    if share >= 0.10 and statistics.median(f) <= floor * 1.10:
+    ratio = statistics.median(f) / floor
+    # What this detects is narrower than "a cap exists": it is "THE CAP IS THE
+    # LIMITER", which is exactly the condition under which a median comparison
+    # is void. A capped run that spends most of its time missing the cap fails
+    # these tests and should -- its median is then a real measurement of load.
+    #
+    # Thresholds measured against five sessions rather than chosen. The first
+    # cut used share >= 0.10 and ratio <= 1.10 and produced a FALSE POSITIVE on
+    # the 13-47 run, calling a 4.55 ms fast tail a "220 Hz cap":
+    #
+    #   session   floor   on floor   median/floor   capped?
+    #   11-04     7.18       0%          1.30       no
+    #   08-56     6.06      47.3%        1.016      yes, 165 Hz
+    #   10-31     6.06      69.8%        1.007      yes, 165 Hz
+    #   11-09     6.06      37.6%        1.040      yes, 165 Hz
+    #   13-47     4.55      15.2%        1.084      NO -- uncapped, 1.78 ms band
+    #
+    # A real cap piles the distribution against the floor: a third or more of
+    # samples on it and a median within 5% of it. Both margins are wide here
+    # (37.6% vs 15.2%, 1.040 vs 1.084). With a hundredth-of-a-millisecond log
+    # and a few dozen samples, some will land on the minimum by chance, so the
+    # minimum being hit more than once proves nothing on its own.
+    if share >= 0.30 and ratio <= 1.05:
         return floor, share, 1000.0 / floor
     return None
 
