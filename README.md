@@ -277,6 +277,11 @@ the two is what caused the error above.
 
 ### The loop
 
+0. `python pzconfig.py --bench` — take the frame cap off, or steps 5 and 6 measure
+   nothing. `--play` puts it back; `--show` says which profile is live. It edits only
+   `vsync`, `uncappedFPS` and the caps file's `game` key, in place, because the game
+   rewrites `options.ini` from memory on exit and a whole-file restore would quietly
+   revert keybinds and volumes along with the cap.
 1. `python pzpreset.py --snapshot my-baseline` — always have a way back.
 2. `--diff` the preset, then `--apply` it. **Game must be closed.**
 3. Launch, go to the *same* spot, same in-game time and weather, enter first person.
@@ -431,32 +436,108 @@ continuous fast travel is vanilla Java chunk loading and is not tunable.
 measure the other end first. Stutter is a frame-time problem and lives here. Delay is
 a simulation-rate problem and does not.
 
+## The client frame time was the refresh interval, not a measurement
+
+Found 2026-11-11, after three sessions had already been compared on it.
+
+The display is **165 Hz**. The ceiling was set three times over: `vsync=true` and
+`frameRate=165` in `options.ini`, and `viewpoint-frame-caps.properties` carrying no
+`game` line, which its own header says means "the monitor's refresh rate".
+
+| session | min | median | p90−p10 | on the 6.06 ms floor | over 6.50 ms |
+|---|---|---|---|---|---|
+| 11-04, before the heap fix | 7.18 | 9.36 | **5.07 ms** | 0% | 100% |
+| 11-11 08-56 | **6.06** | 6.16 | 1.73 ms | 47.3% | 30.5% |
+| 11-11 10-31 | **6.06** | 6.10 | **0.27 ms** | 69.8% | 5.8% |
+| 11-11 11-09 | **6.06** | 6.30 | 1.50 ms | 37.6% | 36.6% |
+
+**Not one sample below 6.06 ms in any session after the heap fix**, in all three to the
+hundredth, where 165 Hz is 6.0606 ms. That is a hard floor, not the fast end of a
+distribution. At the floor the accounted main-thread work is `cache 0.46 far 0.09
+snapshot 1.50` ≈ 2.05 ms of a 6.07 ms frame, with `GPU 0.63 frames behind (at most 1)`:
+the main thread spends about 4 ms waiting on the present rather than working.
+
+Three consequences, all of which had already been acted on:
+
+- **`LIMITER: MAIN THREAD` on those runs means *limited by the present*.** The main
+  thread is simply the thread that blocks on the swap. It is not a statement about
+  main-thread work.
+- **The PZO comparison was "no change visible at the cap", not "no change".** The
+  verdict was right; the reason given for it was weaker than stated. A median that
+  cannot move is not evidence that nothing moved.
+- **The heap result is untouched.** The 11-04 session had no samples anywhere near the
+  cap and a 5.07 ms band, and the verification rested on GC cycle counts and a 3,635 MiB
+  settled heap — neither of which is clamped.
+
+What survives a cap, and is therefore still worth reading from the three sessions: the
+**per-pass GPU ms** (GPU timer queries), eviction counts, the heap, the slow-frame log,
+and the **share of frames that miss the cap** — which ran 30.5% / 5.8% / 36.6% while the
+medians spanned 0.20 ms.
+
+`pzbench.cap()` now detects this and refuses to compare two ceilings; `pzconfig.py`
+takes the ceiling off. The check that the uncap worked is the floor moving below
+6.06 ms, not either script reporting success.
+
+**The same trap, caught earlier in someone else's log and missed here.** It was flagged
+to the host lane on 2026-11-11 — their frame time was pinned flat at 33.33 ms by
+Viewpoint's `graphics.frameGeneration`, making the significance test meaningless — while
+this machine's own log was clamped in a milder form the whole time. A flat signal is
+easier to see in a log you are reading for the first time than in one you have been
+quoting for a week.
+
 ## Open
 
 In priority order.
 
+0. **Uncap first — `python pzconfig.py --bench`.** Prerequisite for 1 and 2, not a
+   separate task. Capped, both land inside a 0.10 ms window and read as nothing.
 1. **Bench `02-mainthread`** (applied 2026-11-04, never measured). Main-thread side, so
-   it can actually move the limiter. Use the 4–5 minute protocol.
-2. **Spend the GPU headroom.** Measured 2026-11-11 over a 20-minute session: main frame
-   median **6.10 ms** against a GPU median of **4.27 ms**, so **1.83 ms** is going spare
-   and the main thread is the limiter. Resolution on that run was 0.12 ms, which makes
-   the headroom **15.5× the noise floor** — anything worth turning up is measurable.
-   `03-sky-and-light` first: `sky+light` is the top pass at 1.31 ms (31% of GPU frame),
-   and `air`, `weather` and `outlines` all sit at 0.00 ms. Cutting GPU quality buys
-   nothing here; the only move is upward.
+   it can actually move the limiter. Use the 4–5 minute protocol, uncapped — a
+   main-thread change is exactly what a frame-time cap hides.
+2. **Spend the GPU headroom — at least 1.5 ms of it, and probably more.** GPU median
+   runs **4.51–4.73 ms** against the 6.06 ms cap. That gap is real and spendable, but it
+   is a **lower bound**: the frame time it is measured against is a ceiling, so the true
+   headroom is unknown until a run is uncapped. A headroom-to-resolution ratio taken
+   against a capped frame time divides one clamped number by another and means nothing,
+   however large it comes out.
+
+   Every GPU quality lever is at its floor: `fogQuality=0`, `perfSkybox=0`,
+   `perfPuddles=0`, `puddles=0`, `water=0`, `bPerfReflections=false`. So the only move is
+   upward, and **this needs no A/B at all** — the stat line attributes GPU ms per pass,
+   so one run at high settings prices every feature at once. Per-pass costs are GPU timer
+   queries and stay valid under a cap, which makes this the one open item that could have
+   been worked the whole time. Top passes measured: `gbuffer` 1.29 ms (28.5%),
+   `sky+light` 1.10 ms (24.2%), `post+taa` 0.59 ms; `air`, `weather` and `outlines` sit
+   at 0.00 ms.
+
+   **Do item 3 first.** Raising quality raises VRAM, and VRAM eviction is the measured
+   stall source — a high-settings run taken before the competitors are gone confounds a
+   GPU measurement with a memory one.
 3. **Reduce what competes for the GPU memory budget.** Measured 2026-11-11 during play:
    PZ holds 3,933 MB and **other processes hold 3,005 MB** — `dwm` 1,735 MB, then
-   Steam/Epic/Battle.net/Samsung Magician/Edge/Code/terminals. Evictions fire at **45%
-   card occupancy** because Windows sizes each process's budget against the others, not
-   because 12 GB is full. Closing Epic (2 processes), Battle.net and Samsung Magician
+   Steam/Epic/Battle.net/Samsung Magician/Edge/Code/terminals. Evictions fire across
+   **45–76% card occupancy, median 67%** (8,262 of 12,282 MiB) because Windows sizes each
+   process's budget against the others, not because 12 GB is full. Quote the range or
+   the median, not the low end — at 45% occupancy the card looks almost empty, which
+   makes the budget mechanism sound stranger than it is. Closing Epic (2 processes), Battle.net and Samsung Magician
    frees ~490 MB and three competitors. Test it against the measured baseline of
    **0.21–0.32 eviction events per minute**.
-4. **`textureCompression` is `true`, and not by choice.** The pre-PZO value was `false`;
-   MPOptimizer enforced `Enabled` mid-session on 2026-11-11 at 09:43 and the change
-   persisted after the mod was removed. Compression lowers VRAM pressure, which is the
-   open problem above, so it is worth keeping — but it is an untested change sitting in
-   the baseline, and it must be declared whenever a run is compared against anything
-   from before 2026-11-11.
+4. **`textureCompression=true` — keep it, deliberately.** It arrived as residue, not a
+   decision: the pre-PZO value was `false`, MPOptimizer enforced `Enabled` mid-session on
+   2026-11-11 at 09:43, and the change outlived the mod. But compression lowers VRAM
+   pressure, and VRAM eviction is the measured stall source above, so the value is right
+   even though nobody chose it. Resolved as a keep rather than reverted as residue — the
+   right value and a trustworthy provenance are different things, and only the first one
+   affects frame time. It still must be declared whenever a run is compared against
+   anything from before 2026-11-11.
+
+**Ruled out, so it does not get proposed again: Viewpoint's own memory pools.**
+`model packs` peaks at 122/128 and sits ≥95% full in 30% of frames, which looks like
+eviction pressure. It is not: evictions land in those frames at **×0.88**, slightly
+*less* than chance over 519 samples. Raising the pool caps would cost VRAM for nothing.
+The first cut of that test read 65 of 65 evictions "in a frame where a pool was full"
+and was vacuous — `sound files` sits at 122/128 in **100%** of frames, so the predicate
+was always true. A condition that is never false cannot be evidence.
 
 Lower priority, unchanged:
 

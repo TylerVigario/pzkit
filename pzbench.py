@@ -184,6 +184,48 @@ def resolution(samples):
     return (hi - lo) / (n ** 0.5)
 
 
+def cap(samples):
+    """Detect a frame-rate ceiling, returning (floor_ms, share_on_it, hz) or None.
+
+    A capped run is not a distribution with a low tail -- it has a HARD FLOOR
+    that many samples sit exactly on and none go below. Measured 2026-11-11 over
+    three sessions at 165 Hz with vsync on: minimum frame time was 6.06 ms in all
+    three, to the hundredth, with 38-70% of samples inside a 0.1 ms bucket at the
+    floor and not one sample underneath it.
+
+    It matters because every frame-time number is then reading a clamp. The median
+    IS the cap, so comparing medians has no power; and the LIMITER verdict reads
+    MAIN THREAD because the main thread is the one that blocks on the present --
+    about 4 of the 6.07 ms are spent waiting rather than working. Three sessions
+    were compared on their medians before anyone noticed."""
+    f = sorted(s["frame_ms"] for s in samples)
+    if len(f) < 8:
+        return None
+    floor = f[0]
+    if floor <= 0:
+        return None
+    on_floor = sum(1 for x in f if x <= floor * 1.004)   # a single 0.4% bucket
+    share = on_floor / len(f)
+    # Both conditions are load-bearing. A floor that few samples reach is just
+    # the fast end of a real distribution, and a median well above the floor
+    # means the run spent its time off the cap, so the cap is not the limiter.
+    if share >= 0.10 and statistics.median(f) <= floor * 1.10:
+        return floor, share, 1000.0 / floor
+    return None
+
+
+def miss(samples, floor_ms, factor):
+    """Share of frames (%) that came in above floor_ms * factor.
+
+    What to compare on when a run is capped. The median cannot move; this can,
+    and does. Across the three capped sessions the medians spanned 0.20 ms while
+    the share over 1.07x the cap ran 5.8% / 30.5% / 36.6%."""
+    f = [s["frame_ms"] for s in samples]
+    if not f:
+        return 0.0
+    return 100.0 * sum(1 for x in f if x > floor_ms * factor) / len(f)
+
+
 def profile(path):
     samples, slow_main, slow_render = parse(path)
     build, ramp, steady = split_warmup(samples)
@@ -230,17 +272,41 @@ def report(p):
           f"  ({band:.2f} ms band, {fps_lo:.0f}-{fps_hi:.0f} fps)")
     print(f"  RESOLUTION: {res:.2f} ms  -- the smallest median shift n={len(steady)} can show")
 
+    ceiling = cap(steady)
+    if ceiling:
+        floor_ms, share, hz = ceiling
+        print(f"\n  !! CAPPED RUN. Hard floor at {floor_ms:.2f} ms ({hz:.0f} Hz): "
+              f"{share*100:.0f}% of samples sit on it, none below.")
+        print("     The frame-time median above is that ceiling, not a measurement, and")
+        print("     comparing it against another run tests nothing. To measure frame time:")
+        print("     python pzconfig.py --bench      (vsync off, frame cap off)")
+        print("     What still carries signal while capped:")
+        print(f"       off the cap       {miss(steady, floor_ms, 1.07):>5.1f}%"
+              f" of frames over {floor_ms*1.07:.2f} ms")
+        print(f"       missed outright   {miss(steady, floor_ms, 1.50):>5.1f}%"
+              f" of frames over {floor_ms*1.50:.2f} ms")
+        print("     Per-pass GPU ms are GPU timer queries and stay valid under a cap. So do")
+        print("     eviction counts, the heap, and the slow-frame log.")
+
     if gmed > 0:
         limiter = "MAIN THREAD" if fmed > gmed else "GPU"
         head = abs(fmed - gmed)
-        print(f"  LIMITER: {limiter}   (headroom on the other side: {head:.2f} ms)")
-        if limiter == "MAIN THREAD":
-            print("  -> GPU-side quality cuts buy no fps here. Spend the headroom instead.")
-        if head < res:
-            print(f"  !! the {head:.2f} ms headroom is below the {res:.2f} ms resolution.")
-            print("     Nothing on the GPU side is worth benching -- judge it by eye.")
+        if ceiling and limiter == "MAIN THREAD":
+            # Not main-thread WORK: the main thread is just what blocks on the swap.
+            print(f"\n  LIMITER: THE PRESENT. Frame time is pinned at the {ceiling[0]:.2f} ms cap")
+            print("     and the main thread is merely the thread that waits for it.")
+            print(f"  -> the GPU median of {gmed:.2f} ms is {head:.2f} ms under the cap. That gap is")
+            print("     real and spendable, but it is a LOWER BOUND on the headroom rather than")
+            print("     the headroom itself -- uncap to find out how much there actually is.")
         else:
-            print(f"  -> headroom is {head / res:.1f}x the resolution, so spending it is measurable.")
+            print(f"  LIMITER: {limiter}   (headroom on the other side: {head:.2f} ms)")
+            if limiter == "MAIN THREAD":
+                print("  -> GPU-side quality cuts buy no fps here. Spend the headroom instead.")
+            if head < res:
+                print(f"  !! the {head:.2f} ms headroom is below the {res:.2f} ms resolution.")
+                print("     Nothing on the GPU side is worth benching -- judge it by eye.")
+            else:
+                print(f"  -> headroom is {head / res:.1f}x the resolution, so spending it is measurable.")
 
     print(f"\n  per-pass GPU ms (median), most expensive first:")
     tot = sum(statistics.median([s["gpu"][x] for s in steady]) for x in PASSES) or 1.0
@@ -310,6 +376,24 @@ def compare(a, b):
     # The comparison is between MEDIANS, so the threshold is the resolution of
     # the weaker run, not its sample spread. Using the spread here was wrong and
     # too strict by a factor of sqrt(n) -- see resolution().
+    ca, cb = cap(sa), cap(sb)
+    if ca or cb:
+        print("\n  !! CAPPED. The frame-time medians above are ceilings, so a comparison")
+        print("     between them tests nothing -- whatever changed, the cap did not move.")
+        for label, s, c in (("before", sa, ca), ("after", sb, cb)):
+            if c:
+                print(f"       {label:<7} cap {c[0]:.2f} ms   off the cap {miss(s, c[0], 1.07):>5.1f}%"
+                      f"   missed outright {miss(s, c[0], 1.50):>5.1f}%")
+            else:
+                print(f"       {label:<7} not capped")
+        if ca and cb:
+            d = miss(sb, cb[0], 1.07) - miss(sa, ca[0], 1.07)
+            print(f"     off-the-cap share moved {d:+.1f} percentage points.")
+        print("     Trust that only if both runs saw the same scene under the same load: it")
+        print("     is a tail statistic, and the tail is where load lives. For a clean")
+        print("     frame-time comparison, uncap both runs -- python pzconfig.py --bench")
+        print("     The per-pass GPU table below is unaffected and is the better read here.")
+
     res = max(resolution(sa), resolution(sb))
     moved = abs(med(sb, lambda x: x["frame_ms"]) - med(sa, lambda x: x["frame_ms"]))
     print(f"\n  frame-time change {moved:.2f} ms against a resolution of {res:.2f} ms")
@@ -317,6 +401,9 @@ def compare(a, b):
         print("  !! NOT A RESULT. The shift is below what these runs can resolve. Either")
         print("     the change does nothing, or you need longer runs (resolution improves")
         print("     as sqrt(n)) or a harder-controlled scene.")
+        if ca or cb:
+            print("     Here it is none of those: a capped run cannot show a frame-time")
+            print("     change at all, however large the change really was.")
     else:
         print(f"  -> {moved / res:.1f}x the resolution, so this is a real difference.")
 
