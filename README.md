@@ -128,16 +128,55 @@ too early in a session to see the problem. At hour 4 the live set is ~2.7 GB aga
 3.07 GB cap, leaving ~370 MB of allocation headroom, so Shenandoah runs a **full cycle
 every ~480 ms, continuously**. Pause time stays negligible because Shenandoah is
 concurrent — but concurrent means its marking and evacuation threads compete for CPU
-*with the main thread*, which is the limiter here. Raising `-Xmx` is now the
-best-supported single change, and the loop can check it: play to hour 3+ and read the
-cycle rate.
+*with the main thread*, which is the limiter here.
 
-**VRAM is at 93% by hour 4**, up 3.7 GB from fresh, with the first evictions (4,
-58 MiB) in the final sample. `options.ini` has every texture lever at maximum —
-`textureCompression=false`, `texture2x=true`, `maxTextureSize=4`,
-`maxVehicleTextureSize=4`. Stated carefully: **58 MiB of eviction is not yet a
-measured cost**, it is a ceiling being approached. It is a reason to keep watching,
-not yet a reason to give up texture quality.
+**`-Xmx3072m` → `6144m` is applied and verified.** Applied 2026-11-09, backed up to
+`ProjectZomboid64.json.pretune-2026-11-09T090752`; only `-Xmx` was touched. Measured
+across three sessions on 2026-11-11:
+
+| per 10 s | `-Xmx3072m` | `-Xmx6144m` |
+|---|---|---|
+| Shenandoah cycles | median **21**, max 34 | median **0** |
+| concurrent GC work | median **8.7 s**, max 12.4 s | median **0 ms** |
+| heap used | 2,591 of ~3,000 — pinned at the ceiling | 3,635 of ~5,550 |
+
+8.7 seconds of collector work per 10 seconds of wall clock is roughly a core running
+continuously, and it tracked straight into frame time: 7.89 ms at 15 cycles, 11.17 ms
+at 24, back to 7.60 ms when it dipped to 21. **The heap was simply smaller than the
+working set** — 3,635 MiB cannot fit in a 3,072 MiB ceiling, which is the whole bug
+and the one inference that needs no other controls.
+
+**It does not take hour 3 to see.** The old config was already at 15 cycles/10 s inside
+its first ten minutes and 21 by minute 20, so a 25-minute session is sufficient. The
+"3 cycles when fresh" figure came from too early a sample.
+
+**Confounds that were checked rather than assumed.** MPOptimizer was absent from the
+2026-11-04 run and present on 2026-11-11, and it installs its own "Memory & Garbage
+Collection Manager" — so the first comparison had two new variables plus
+single-player → multiplayer. Removing it changed nothing: GC stayed at median 0 cycles
+with the mod gone, so the collector manager contributed nothing and `-Xmx` is the cause.
+Separately, the collector itself is **Shenandoah by Viewpoint's edit, not the game's
+default** — vanilla selects ZGC on the Windows 10/11 key. The thrash was therefore
+Shenandoah's behaviour at a 3 GB ceiling; ZGC at 3072m was never tried and does not
+need to be.
+
+**VRAM eviction is a real cost, and it is not the card filling up.** Measured
+2026-11-11 across three sessions: eviction events fire at **45–76% card occupancy**,
+and **13 of 40 main-thread stalls land within 1.5 s of one — 65× what chance gives**
+(tested against 2,000 randomised placements over the same span). The stalls run
+130–280 ms with Viewpoint attributing only **1.4 ms** of each to itself; the rest is
+the game re-uploading what the driver dumped. Worst observed 265 ms while standing
+still.
+
+The mechanism is the Windows GPU memory **budget**, not capacity. Measured during play:
+PZ holds 3,933 MB while other processes hold **3,005 MB** — `dwm` alone 1,735 MB. The
+manager sizes each process's budget against the others, so PZ is evicted while 6.7 GB
+of the card reads "free". The lever is therefore *fewer resident competitors*, not
+lower texture settings.
+
+`options.ini` texture levers: `texture2x=true`, `maxTextureSize=4`,
+`maxVehicleTextureSize=4`, and `textureCompression=true` — the last one changed by
+MPOptimizer rather than chosen. See **Open**.
 
 **The hitches are bursts, not a rate — and the earlier hypothesis was wrong.** 22 slow
 main-thread frames in 6m20s, but **17 of them inside one 8-second window**
@@ -145,9 +184,17 @@ main-thread frames in 6m20s, but **17 of them inside one 8-second window**
 `shadow` GPU pass tripled across it, 0.97 → 1.64 → 2.21 ms, while fps fell to 67.
 That is a sudden crowd of shadow casters, not shader variants compiling and not a
 texture-streaming stall — this file was four hours into the session, long past any
-cold cache. Worst frame 136 ms, well clear of a hang. **So shadow settings are the
-lever for the hitching specifically**, which is a different question from median fps
-and needs a different instrument than a median.
+cold cache. Worst frame 136 ms, well clear of a hang.
+
+**There are two hitch classes and they need separating.** That 8-second burst is one:
+a crowd of shadow casters, where the `shadow` pass itself triples and shadow settings
+are the lever. The other is the recurring kind measured 2026-11-11 — roughly one every
+25–69 seconds, median 177–198 ms, with Viewpoint's own work at 1.4 ms and the cost in
+GPU-memory eviction. Shadow settings do nothing for the second kind. **The attribution
+in each `slow frame on the main thread` line is what tells them apart:** a large `ours`
+is the mod's own work, a small `ours` with a large remainder is the game re-uploading,
+the renderer, or the server. Reading the median instead of the attribution is what kept
+this confused for a week.
 
 ## Things measured and then found wrong
 
@@ -239,6 +286,29 @@ the two is what caused the error above.
 5. Quit, then `python pzbench.py <old log> <new log>`.
 6. **One change per run.** Two changes at once are unattributable.
 
+**Step 5 is the one that does not get done.** The 2026-11-04 session sat unanalysed for
+five days and `02-mainthread` was applied 2026-11-04 and never measured at all — both
+logs existed the whole time. So `pzauto.py` does it instead:
+
+```
+python pzauto.py            # watch; report each session as it ends
+python pzauto.py --once     # report any finished, unreported session now
+python pzauto.py --report <capture>
+```
+
+A session counts as over only when **all three** hold: no `ProjectZomboid64.exe`, its
+capture idle for 90 s, and no report written yet. Each alone is wrong — no process is
+also true *before* launch, and a quiet capture is also true in a menu. A failed
+`tasklist` is treated as "running", so a broken query cannot produce a mid-session
+report. Runs under 12 stat lines are skipped and recorded as skipped, because `pzbench`
+will otherwise state a confident median over nothing.
+
+Reports land in `reports/<session>.txt`, each compared against the previous session
+that produced one, and `reports/INDEX.md` carries one line per session so the trend is
+readable without opening any of them. The index is parsed back out of `pzbench`'s own
+output, scoped to that capture's profile block, so it cannot disagree with the report
+beside it.
+
 Logs live in `~/Zomboid/Logs/`. Two traps, both of which have already cost time:
 
 - PZ **rotates the previous run** into `Logs/logs_<timestamp>/` on launch, so the log
@@ -323,32 +393,70 @@ Every write backs up first to `backups/`, timestamped; `--restore` puts one back
 `01` and `02` applied 2026-11-04 14:50; both verified to have changed exactly their
 intended lines and nothing else. Not yet benched.
 
+## What this harness cannot see, and the day it mattered
+
+**Every metric in here is client-side. None of them can see a server.** On 2026-11-11
+a multiplayer session was unplayable — actions not registering, a car that stopped
+dead, a death to a horde — while this harness reported the best numbers it had ever
+produced: main frame 6.07 ms, 165 fps, zero slow frames, zero evictions, GC idle. The
+client was flawless and the game was broken.
+
+The server's simulation tick had collapsed from ~10/s to **0.2/s**, about 2.5 seconds
+per tick, for twelve minutes. `pzbench` cannot detect that and never will; a clean
+report is not evidence that the game plays well.
+
+What the client log *can* contribute is the trigger and the corroboration:
+
+| per minute | collapse (2026-11-11 09:39) |
+|---|---|
+| `remembered chunks` | 499 → 14,010 over 25 min |
+| `zombies loaded` | 29 → 196 → 410 (cap) |
+| `EquipPacket.set get invalid arguments` | 51 |
+| `player is not found` | 34 |
+| main thread frame | **unchanged at 6.07 ms** |
+
+`remembered chunks` is the useful column and it had never been read before: the cause
+was the **rate new map area is entered**, not zombie population (sandbox was Normal).
+The per-minute sync-error counts are the client-side fingerprint of a stalled server,
+and they are the right thing to grep for when the game feels wrong but the frame time
+does not move.
+
+Root cause was found server-side by thread dump — a mod's `OnTick` handler draining an
+uncapped queue of loaded containers — and fixed by capping it. The after: **7.65 ticks/s
+minimum under five times the loading rate**, with `EquipPacket` failures and
+`player is not found` at **zero** across a 20-minute run. The residual hitch under
+continuous fast travel is vanilla Java chunk loading and is not tunable.
+
+**The rule this leaves behind:** when the symptom is *delay* rather than *stutter*,
+measure the other end first. Stutter is a frame-time problem and lives here. Delay is
+a simulation-rate problem and does not.
+
 ## Open
 
-In priority order, and the first one is now well ahead of the rest.
+In priority order.
 
-1. **`-Xmx3072m` → `6144m`** — **applied 2026-11-09**, backed up to
-   `ProjectZomboid64.json.pretune-2026-11-09T090752`, JSON re-validated, game closed
-   at the time. The hour-4 table is the case: 21 GC cycles per 10 s against 3 when
-   fresh, heap pinned at the ceiling, on a host where the main thread is the limiter.
-   Only `-Xmx` was touched — Viewpoint manages that file (it keeps a
-   `.viewpoint-backup`) and swapped the collector ZGC → Shenandoah; **the collector
-   was left alone**, it is behaving. **Unverified.** The test is to play to hour 3+
-   and read the cycle rate off the stat line; a 4-minute run cannot see it, because
-   the problem only exists once the heap has filled. If Viewpoint or a Steam file
-   verification rewrites the file, this reverts silently — re-check the value before
-   concluding the change did nothing.
-2. **Bench `02-mainthread`** (applied 2026-11-04, never measured). Main-thread side, so
+1. **Bench `02-mainthread`** (applied 2026-11-04, never measured). Main-thread side, so
    it can actually move the limiter. Use the 4–5 minute protocol.
-3. **Then spend the GPU headroom**, ~1.4 ms of it, one key at a time — `03-sky-and-light`
-   first, since both its keys land in the most expensive pass. Now genuinely
-   measurable at 15:1 signal-to-noise.
-4. **The hitching needs a different instrument.** It is bursty (17 of 22 slow frames in
-   one 8-second window) and correlated with the `shadow` pass tripling, so a median
-   cannot see it. Wanted: a per-burst report keyed off the `frames over 50 ms` counter
-   that already appears in every stat line.
-5. **`textureCompression=false`, `texture2x=true`** — VRAM reached 93% by hour 4 with
-   the first evictions. Watch it; do not trade texture quality for it yet.
+2. **Spend the GPU headroom.** Measured 2026-11-11 over a 20-minute session: main frame
+   median **6.10 ms** against a GPU median of **4.27 ms**, so **1.83 ms** is going spare
+   and the main thread is the limiter. Resolution on that run was 0.12 ms, which makes
+   the headroom **15.5× the noise floor** — anything worth turning up is measurable.
+   `03-sky-and-light` first: `sky+light` is the top pass at 1.31 ms (31% of GPU frame),
+   and `air`, `weather` and `outlines` all sit at 0.00 ms. Cutting GPU quality buys
+   nothing here; the only move is upward.
+3. **Reduce what competes for the GPU memory budget.** Measured 2026-11-11 during play:
+   PZ holds 3,933 MB and **other processes hold 3,005 MB** — `dwm` 1,735 MB, then
+   Steam/Epic/Battle.net/Samsung Magician/Edge/Code/terminals. Evictions fire at **45%
+   card occupancy** because Windows sizes each process's budget against the others, not
+   because 12 GB is full. Closing Epic (2 processes), Battle.net and Samsung Magician
+   frees ~490 MB and three competitors. Test it against the measured baseline of
+   **0.21–0.32 eviction events per minute**.
+4. **`textureCompression` is `true`, and not by choice.** The pre-PZO value was `false`;
+   MPOptimizer enforced `Enabled` mid-session on 2026-11-11 at 09:43 and the change
+   persisted after the mod was removed. Compression lowers VRAM pressure, which is the
+   open problem above, so it is worth keeping — but it is an untested change sitting in
+   the baseline, and it must be declared whenever a run is compared against anything
+   from before 2026-11-11.
 
 Lower priority, unchanged:
 
