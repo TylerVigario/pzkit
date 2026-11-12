@@ -208,22 +208,50 @@ catches up. This one freezes and resumes from the same spot. That rules out posi
 correction entirely, and it points at a local freeze — which is what the client log had
 been recording all along as `slow frame on the main thread`.
 
-**The stalls scale with session progress.** 23 steady-state stalls over 32 minutes,
-0.66/min:
+**The stalls are a hump, not a climb, and neither elapsed time nor explored area
+explains them.** Measured over the complete 135-minute session: 43 steady-state stalls,
+0.32/min.
 
-| | median stall |
-|---|---|
-| first 10 minutes | **88 ms** |
-| after 20 minutes | **253 ms** |
+| elapsed | stalls | median | worst | chunks by then |
+|---|---|---|---|---|
+| 0–15 | 6 | 156 ms | 233 | 2,008 |
+| 15–30 | 12 | 225 ms | 269 | 6,665 |
+| 30–45 | 6 | **272 ms** | 302 | 7,208 |
+| 45–60 | 0 | — | — | 7,228 |
+| 60–75 | 7 | 188 ms | 321 | 8,072 |
+| 75–90 | 0 | — | — | 8,985 |
+| 90–105 | 6 | **54 ms** | 104 | 11,942 |
+| 105–120 | 6 | 78 ms | 300 | 14,345 |
+| 120–150 | 0 | — | — | 16,558 |
 
-Spearman rho against stall size: `remembered chunks` +0.599, `map layouts` +0.599,
-`elapsed minutes` +0.599 — and `chunks` against `elapsed` is **+1.000**. In a session
-spent travelling continuously those three are one curve, so **explored area and elapsed
-time cannot be told apart here.** That is a limit of the data, not a hedge.
+They rise to a peak around 30–45 minutes and then fall away, stopping entirely for the
+last half hour. **Spearman rho against elapsed time over the whole session is −0.273** —
+negative.
 
-**The discriminating run is to stand still for ~30 minutes**, where time advances and
-area does not. Stalls still climbing to 250 ms means something time-based; stalls holding
-near 88 ms means explored area, and the fix is in what gets retained. Not yet done.
+**Explored area is dead as a driver, decisively.** `map layouts` tripled from 35,073 to
+103,714 between the stally and quiet halves while median stall size fell from 217 ms to
+55 ms, and `remembered chunks` more than doubled from 7,228 to 16,558 across a stretch
+containing almost no stalls at all. A quantity that triples while the symptom quarters is
+not causing the symptom.
+
+**Nothing else separates the two halves.** Chunk loading rate, zombies loaded, draws per
+frame, frame time, heap and committed bytes are flat across both. Neither client leaks
+(see `pzproc.py`), the heap is flat, GC cycles are median 0, and no counter Viewpoint
+reports moves with the stalls. **The mechanism is unknown and no current hypothesis
+survives.**
+
+**A 63-minute window gave the opposite answer**, which is the methodological point worth
+keeping: over the first 63 minutes the same measurement produced rho +0.599 against
+elapsed time, chunks and map layouts alike, all three collinear at rho 1.000. The curve
+had simply not turned over yet. A monotonic trend measured inside half a session is not a
+trend, and the +0.599 was real for that window and false for the session.
+
+**What the stand-still run now tests.** It was designed to separate elapsed time from
+explored area, and both are now excluded, so that is no longer its job. What it buys
+instead is a controlled zero-activity baseline: 30 minutes parked, no travel, no
+combat. Stalls occurring anyway would make them intrinsic to running the client; none
+occurring would make them activity-driven and point at what the player was doing rather
+than at how long or how far. Not yet done.
 
 **Ruled out, both ends.** The host lane ran the server-side exclusions:
 
