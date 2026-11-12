@@ -30,8 +30,9 @@ preserving every other line and the file's order.
   options.ini                       vsync, uncappedFPS
   viewpoint-frame-caps.properties   game
 
-`frameRate` is deliberately left alone: with uncappedFPS it is not consulted,
-and leaving it means `--play` restores exactly the number that was there.
+`frameRate` IS set by --play, because on a variable-refresh display the cap is
+the mechanism rather than V-Sync. --bench leaves it untouched, since uncappedFPS
+makes it moot.
 
 THE CHECK THAT MATTERS
 ----------------------
@@ -63,10 +64,39 @@ GAME_EXE = "ProjectZomboid64.exe"
 
 # profile -> {file: {key: value}}.  None as a value means "remove the key",
 # which for the caps file is how you say "follow the monitor's refresh rate".
+# This machine drives an LG UltraGear at 1440p with a 50-165 Hz G-Sync window, so
+# neither profile uses V-Sync. With variable refresh the display follows the GPU,
+# and V-Sync's two costs are pure loss: it buffers, adding about a frame of
+# latency, and a frame that misses the window waits a WHOLE interval, which is
+# the stutter it is meant to prevent.
+#
+# Measured here 2026-11-11, which is why this is a configuration and not an
+# opinion. With vsync=true the frame time had a hard floor at 6.06 ms, 165.0 Hz,
+# with NOT ONE sample below it across three sessions and 38-70% sitting exactly
+# on it. With vsync off and the same scene the median was 4.93 ms, 203 fps. So
+# V-Sync cost about 1.1 ms per frame and concealed a third of the headroom.
+#
+# PLAY therefore caps BELOW the refresh ceiling rather than using V-Sync. That is
+# the whole trick with variable refresh: inside the 50-165 Hz window the panel
+# matches the GPU, so there is no tearing and no added latency, but above 165 the
+# GPU outruns the panel and falls out of the window into ordinary tearing. 158
+# leaves margin because an in-engine cap is not frame-accurate; anywhere in
+# 158-162 is reasonable. The cap is what does the work, not V-Sync.
+#
+# Driver side, which this script cannot set and should not try to: G-Sync enabled,
+# and NVIDIA's V-Sync left ON as a backstop for anything that ever exceeds 165.
+# With the cap below the ceiling that backstop never engages, so it costs nothing.
+#
+# BENCH removes the cap entirely, which is correct for measurement and wrong for
+# play: above 165 fps it leaves the G-Sync window and renders frames the panel
+# cannot show.
+REFRESH_HZ = 165
+PLAY_CAP = "158"
+
 PROFILES = {
     "play": {
-        OPTIONS: {"vsync": "true", "uncappedFPS": "false"},
-        CAPS: {"game": None},
+        OPTIONS: {"vsync": "false", "uncappedFPS": "false", "frameRate": PLAY_CAP},
+        CAPS: {"game": PLAY_CAP},
     },
     "bench": {
         OPTIONS: {"vsync": "false", "uncappedFPS": "true"},
