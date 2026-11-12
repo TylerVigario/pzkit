@@ -1,0 +1,36 @@
+# How far out the world actually SIMULATES rather than merely draws.
+#
+# Separate from 05-fidelity because this is a different kind of cost and a
+# different kind of value. 05 makes the distance look better; this makes it
+# behave properly. Both are main-thread, neither can be priced from a single
+# run, so they are two steps.
+#
+# fullRateCharacters is the animation radius: beyond 16 blocks, characters and
+# zombies currently update at a reduced rate, which is what makes distant crowds
+# look like they are moving in slow motion. 24 extends that without doubling it.
+#
+# unawareZombiesThinned is the ONE TO TEST ALONE, and it is deliberately NOT in
+# this bundle. Setting it false makes every unaware zombie update fully, and its
+# cost scales with the zombie count rather than with a radius -- the server caps
+# at 410, and this morning's collapse happened with the cap reached. A bundle
+# containing it would be unattributable the moment the population changes, which
+# is exactly the mistake of changing two things at once dressed up as one
+# preset. Apply it by hand, alone, on a run with a known population:
+#
+#     lod.unawareZombiesThinned=false
+#
+# Budget is the same 1.40 ms as 05, and these two bundles are competing for it.
+# Apply 05, measure, come back to --play, then apply this and measure again.
+# Whichever buys more for its cost keeps the budget.
+#
+# Measure with the cap OFF (python pzconfig.py --bench) or the frame time is
+# pinned at 6.33 ms and nothing is measurable.
+#
+# UNMEASURED, like 05. The live values are in the comments.
+target: viewpoint
+
+lod.fullRateCharacters=24
+lod.keptSnapshotsPosed=true
+corpses.limit=60
+corpses.inView=true
+lod.packRing=4

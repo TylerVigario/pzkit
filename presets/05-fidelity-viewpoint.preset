@@ -1,0 +1,36 @@
+# Visual draw distance. MAIN-THREAD cost, which is the part that matters.
+#
+# The GPU keys in 04-high could be priced individually because the stat line
+# attributes GPU ms per pass. There is no equivalent for the main thread: it
+# reports `main ms cache / far / snapshot` and nothing per feature. So these
+# cannot be read off one run the way the GPU table can, and they need a real
+# before/after. That is why this is a separate preset from 06-interactivity
+# rather than one big push -- two bundles, two measured steps.
+#
+# Budget: the play profile caps at 158 fps on a 50-165 Hz G-Sync panel, which is
+# 6.33 ms per frame against a measured 4.93 ms median. So 1.40 ms is spendable.
+# That is not much for seven keys, and this bundle may well not fit. Not fitting
+# is a result: bisect from here rather than creeping up from the floor, because
+# cost is only attributable to a setting that is actually costing something.
+#
+# Measure with the cap OFF (python pzconfig.py --bench), or the frame time is
+# pinned at 6.33 ms and the comparison tests nothing -- pzbench will say CAPPED
+# RUN and refuse. Then come back to --play.
+#
+# interiorFurniture is the one with no distance to tune: it is furniture inside
+# buildings you are not in, off entirely at present. The largest visual change
+# here and the most likely to be expensive, since it adds geometry rather than
+# extending a radius.
+#
+# UNMEASURED. Every number below is a judgement about what "further" should mean,
+# not a value read from anywhere. The live values are in the comments.
+target: viewpoint
+
+pack.trueweathers.farShadows=true
+lod.interiorFurniture=true
+lod.farBlocks=26
+lod.shellFullBlocks=4
+lod.boxesFineBlocks=5
+lod.treesFadeBlocks=12
+lod.treesGoneBlocks=24
+lod.farColoursFullBlocks=22
