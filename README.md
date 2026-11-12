@@ -371,6 +371,17 @@ Kept because the wrong version is instructive.
 - **"VRAM already in use" is the desktop**, not a leak: `dwm` 1820 MB,
   PhoneExperienceHost 652 MB, msedge 459 MB, steamwebhelper 323 MB, and a tail of tray
   apps. ~2.7 GB resident before the game starts.
+- **"CRLF on both sides" was a broken instrument, not a reading.** Comparing the Workshop
+  mod sources against the patched copies, `grep -c $''` reported every line of every
+  file as containing a CR, and that was taken as "consistent CRLF both sides". The mod
+  files are **LF only, with zero CR bytes** -- proven by SHA-256: the file sizes and
+  hashes match an LF file exactly, and a CRLF copy of a 575-line file would be 575 bytes
+  larger with a different hash. The quoting did not survive into the function that ran
+  the grep, so the pattern matched the letter `r` instead of a carriage return, and
+  almost every line of Lua contains an `r`. **A count equal to the line count is a
+  warning sign, not a confirmation** -- the same shape of error as a counter that resets
+  per window. Count bytes with `b"" in raw`, or check a hash, rather than grepping
+  for an escape.
 
 ---
 
