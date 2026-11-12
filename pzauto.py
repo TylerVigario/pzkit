@@ -42,6 +42,7 @@ comparison nobody runs by hand. Pass --no-compare for a solo profile.
 
 import argparse
 import json
+import re
 import subprocess
 import sys
 import time
@@ -172,7 +173,10 @@ def index_line(cap, out, prev):
     limiter = "?"
     for line in block:
         if "LIMITER:" in line:
-            limiter = line.split("LIMITER:")[1].split("(")[0].strip()
+            # Stop at a bracket OR a full stop: the capped verdict is a
+            # sentence, not a one-word label, and the whole thing in a
+            # table cell makes the index unreadable.
+            limiter = re.split(r"[(.]", line.split("LIMITER:")[1])[0].strip()
     verdict = ""
     if "NOT A RESULT" in out:
         verdict = "no measurable change"

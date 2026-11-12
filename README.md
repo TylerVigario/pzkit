@@ -246,12 +246,32 @@ elapsed time, chunks and map layouts alike, all three collinear at rho 1.000. Th
 had simply not turned over yet. A monotonic trend measured inside half a session is not a
 trend, and the +0.599 was real for that window and false for the session.
 
-**What the stand-still run now tests.** It was designed to separate elapsed time from
-explored area, and both are now excluded, so that is no longer its job. What it buys
-instead is a controlled zero-activity baseline: 30 minutes parked, no travel, no
-combat. Stalls occurring anyway would make them intrinsic to running the client; none
-occurring would make them activity-driven and point at what the player was doing rather
-than at how long or how far. Not yet done.
+**The stand-still run, done 2026-11-11 16:10:29–16:34:24.** 24 minutes parked, with
+`remembered chunks` holding at **16,558 → 16,558** — zero map loading, a clean
+stand-still. Three stalls: 209.5 ms at 16:25:57, then 147.2 and 191.3 ms at 16:34:17 and
+16:34:24, which coincide with the game closing and are discarded as shutdown work.
+
+That leaves **a 209.5 ms stall while stationary, with nothing loading and nothing
+happening**, and it settles two things:
+
+- **Magnitude is independent of activity.** 209 ms parked sits inside the 147–300 ms
+  range from the active periods. Stopping does not make them smaller.
+- **Frequency is not.** One clean stall in ~15 minutes of undisturbed parking against
+  0.32/min across the session. Activity makes them more frequent, not bigger.
+
+So travel, map loading and player activity are eliminated as causes. The process sampler
+over the same window is flat — handles +3, threads 0, private −2%, working set −6% —
+which matches the host lane's result on its own machine and kills resource growth on both.
+
+One refinement to the paragraph above: explored area is dead as a **growth** driver, but
+16,558 chunks were still **resident** while parked, so explored area as a *level* is not
+excluded. A periodic sweep over resident state would stall whether the player moves or
+not. The hump shape argues against it; it is not dead the way the growth story is.
+
+**The next run needs no second machine.** Stalls happen parked and idle, so they should
+reproduce in single player — which removes the server, the network, the other client and
+vehicle sync in one step. Load any single-player save, stand still 20 minutes, quit. Not
+yet done.
 
 **Ruled out, both ends.** The host lane ran the server-side exclusions:
 
