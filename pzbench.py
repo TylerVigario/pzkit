@@ -9,19 +9,34 @@ costs, main-thread breakdown, VRAM and heap. That is everything a benchmark need
 this just turns it into numbers you can compare between runs.
 
 Usage:
-    python pzbench.py <DebugLog.txt> [<DebugLog.txt> ...]
+    python pzbench.py [--from-load] <DebugLog.txt> [<DebugLog.txt> ...]
 
-Two runs are compared pairwise against the first.
+Two runs are compared pairwise against the first. A pztail capture, a raw DebugLog
+and console.txt all work: Viewpoint writes the same lines to each.
 
 Warmup is reported separately from steady state on purpose. Entering first person
 builds the whole deferred pipeline and compiles shader variants -- the frame that
 hung the game was a warmup frame of 2678 ms. Mixing that into a median hides both
 the stall and the real frame cost.
+
+HITCHES are reported from Viewpoint's own "slow frame" lines, by attribution and
+not by median. Each line splits the frame into `ours` (Viewpoint's own work) and
+`the rest` (on the main thread the game's update and the collector's pauses; on the
+render thread the game's own drawing, or waiting for the main thread). That split
+is what separates the two hitch classes in README.md: a large `ours` is the mod's
+work and its settings are the lever, a small `ours` with a large rest is not
+Viewpoint at all. --from-load drops everything before the first exit from
+GameLoadingState, so loading stalls and startup errors stay out of it.
+Script exceptions are split at that same point and listed by source. Startup is
+dominated by noise -- a mod without an optional folder logs one visitFileFailed per
+missing path, 238 of 242 in one session -- so the source list is what to read, not
+the count.
 """
 
 import re
 import sys
 import statistics
+from collections import Counter
 from pathlib import Path
 
 PASSES = ["floors", "shadow", "gbuffer", "occlusion", "sky+light", "far",
@@ -45,9 +60,75 @@ RE_SLOWRENDER = re.compile(r"slow frame on the render thread: ([\d.]+) ms")
 RE_DRAWS = re.compile(r"draws/frame (\d+)")
 RE_REBUILDS = re.compile(r"rebuilds/frame ([\d.]+) meshes (\d+)")
 
+# "slow frame on the main thread: 626.2 ms, ours 538.7 (chunk cache 56.4: 15 builds;
+#  ...; by part: chunk cache 55.9, lights 290.6, ...), the rest 87.5 (...)"
+RE_HITCH = {
+    "main": re.compile(r"slow frame on the main thread: ([\d.]+) ms, ours ([\d.]+) "
+                       r"\(([^()\n]*)\), the rest ([\d.]+)"),
+    # "slow frame on the render thread: 65.1 ms, our passes 27.5 (floors 4.9 shadow
+    #  14.5 ...), the rest 37.6 (...)"
+    "render": re.compile(r"slow frame on the render thread: ([\d.]+) ms, our passes ([\d.]+) "
+                         r"\(([^()\n]*)\), the rest ([\d.]+)"),
+}
+RE_HITCH_TOTAL = {"main": RE_SLOWMAIN, "render": RE_SLOWRENDER}
+RE_EXCEPTION = re.compile(r"> ([^>\n]+?)> Exception thrown")
+RE_CLOCK = re.compile(r" st:([\d,]+)>")
+LOADED = "STATE: exit zombie.gameStates.GameLoadingState"
 
-def parse(path):
+
+def _hitch_parts(thread, inner):
+    """Named parts of one slow frame, as {name: ms}."""
+    if thread == "render":
+        return {k: float(v) for k, v in re.findall(r"([A-Za-z+]+)\s+([\d.]+)", inner)}
+    i = inner.find("by part:")
+    out = {}
+    for item in (inner[i + len("by part:"):].split(",") if i >= 0 else []):
+        m = re.match(r"\s*(.+?)\s+([\d.]+)\s*$", item)   # "none over 1 ms" never matches
+        if m:
+            out[m.group(1)] = float(m.group(2))
+    return out
+
+
+def parse_hitches(text):
+    """Every slow frame, with Viewpoint's split of it where the line carries one."""
+    slow = {"main": [], "render": []}
+    for line in text.splitlines():
+        if "slow frame on the" not in line:
+            continue
+        for thread in slow:
+            m = RE_HITCH[thread].search(line)
+            if m:
+                slow[thread].append({"total": float(m.group(1)), "ours": float(m.group(2)),
+                                     "rest": float(m.group(4)),
+                                     "parts": _hitch_parts(thread, m.group(3))})
+                break
+            m = RE_HITCH_TOTAL[thread].search(line)
+            if m:   # a line in some other shape: count it, without a split
+                slow[thread].append({"total": float(m.group(1)), "ours": None,
+                                     "rest": None, "parts": {}})
+                break
+    return slow
+
+
+def parse(path, from_load=False):
     text = Path(path).read_text(encoding="utf-8", errors="replace")
+    loaded_at = text.find(LOADED)
+    if from_load and loaded_at > 0:
+        text = text[loaded_at:]
+        loaded_at = 0
+    if loaded_at >= 0:
+        exceptions = {"startup": Counter(RE_EXCEPTION.findall(text[:loaded_at])),
+                      "in game": Counter(RE_EXCEPTION.findall(text[loaded_at:]))}
+    else:
+        exceptions = {"whole log, which never finished loading": Counter(RE_EXCEPTION.findall(text))}
+    # st: is a millisecond clock with an arbitrary origin, and 0 until it is set:
+    # over the 2026-11-11 13:47 capture its change equalled the wall-clock change
+    # to the second (9898 s), while its first value was 6h25m. So only a
+    # difference of nonzero readings means anything.
+    clock = [c for c in (int(x.replace(",", "")) for x in RE_CLOCK.findall(text)) if c > 0]
+    span_s = (clock[-1] - clock[0]) / 1000 if len(clock) > 1 else 0
+    extra = {"hitches": parse_hitches(text), "exceptions": exceptions,
+             "span_s": span_s, "loaded": loaded_at >= 0}
     samples = []
     for line in text.splitlines():
         if "gpu ms floors" not in line:
@@ -76,9 +157,9 @@ def parse(path):
                     s[k] = float(v)
         samples.append(s)
 
-    slow_main = [float(m) for m in RE_SLOWMAIN.findall(text)]
-    slow_render = [float(m) for m in RE_SLOWRENDER.findall(text)]
-    return samples, slow_main, slow_render
+    slow_main = [h["total"] for h in extra["hitches"]["main"]]
+    slow_render = [h["total"] for h in extra["hitches"]["render"]]
+    return samples, slow_main, slow_render, extra
 
 
 def split_warmup(samples):
@@ -245,14 +326,15 @@ def miss(samples, floor_ms, factor):
     return 100.0 * sum(1 for x in f if x > floor_ms * factor) / len(f)
 
 
-def profile(path):
-    samples, slow_main, slow_render = parse(path)
+def profile(path, from_load=False):
+    samples, slow_main, slow_render, extra = parse(path, from_load)
     build, ramp, steady = split_warmup(samples)
     return {
         "path": Path(path).name,
         "samples": len(samples),
         "steady": steady, "warmup": build, "ramp": ramp,
         "slow_main": slow_main, "slow_render": slow_render,
+        "from_load": from_load, **extra,
     }
 
 
@@ -361,16 +443,59 @@ def report(p):
     if warm:
         w = max(s["cpu_total"] for s in warm)
         print(f"\n  PIPELINE BUILD: {len(warm)} sample(s), worst render CPU {w:.0f} ms")
-    if p["slow_main"]:
-        print(f"  slow main-thread frames logged: {len(p['slow_main'])}"
-              f"  worst {max(p['slow_main']):.1f} ms")
-    if p["slow_render"]:
-        print(f"  slow render-thread frames logged: {len(p['slow_render'])}"
-              f"  worst {max(p['slow_render']):.1f} ms")
+
+
+BUCKETS = ((100, "50-100"), (250, "100-250"), (500, "250-500"), (float("inf"), "500+"))
+REST = {"main": "the game's update and the collector",
+        "render": "the game's own drawing, or waiting on the main thread"}
+
+
+def report_hitches(p):
+    """Slow frames by attribution, and script exceptions by phase. Printed even
+    when the run never settled: a session that only stutters is still worth reading."""
+    hitches, exc = p["hitches"], p["exceptions"]
+    if not (hitches["main"] or hitches["render"] or any(exc.values())):
+        return
+    where = "from the end of loading" if p["from_load"] and p["loaded"] else "whole log"
+    span = f", over {p['span_s'] / 60:.0f} min" if p["span_s"] else ""
+    print(f"\n  HITCHES ({where}{span})")
+    for thread in ("main", "render"):
+        frames = hitches[thread]
+        if not frames:
+            print(f"  slow {thread}-thread frames: none")
+            continue
+        totals = [h["total"] for h in frames]
+        b = Counter(next(label for lim, label in BUCKETS if t < lim) for t in totals)
+        rate = f", one every {p['span_s'] / len(frames):.0f} s" if p["span_s"] else ""
+        print(f"  slow {thread}-thread frames: {len(frames)}{rate}, worst {max(totals):.0f} ms   "
+              + "  ".join(f"[{label} ms] {b[label]}" for _, label in BUCKETS if b[label]))
+        split = [h for h in frames if h["ours"] is not None]
+        if split:
+            ours_big = sum(1 for h in split if h["ours"] >= h["rest"])
+            print(f"    Viewpoint's own work is the larger part of {ours_big}, the rest "
+                  f"({REST[thread]}) of {len(split) - ours_big}")
+            print(f"    median: ours {statistics.median(h['ours'] for h in split):.1f} ms, "
+                  f"the rest {statistics.median(h['rest'] for h in split):.1f} ms")
+        parts, named = Counter(), Counter()
+        for h in frames:
+            for k, v in h["parts"].items():
+                parts[k] += v
+                named[k] += 1
+        if parts:
+            print("    Viewpoint's parts, total ms over these frames: "
+                  + ", ".join(f"{k} {v:.0f} ({named[k]}x)" for k, v in parts.most_common(6)))
     # A frame over ~5000 ms of unresponsiveness is what Windows closes as AppHangB1.
     worst = max(p["slow_main"] + p["slow_render"] + [0])
     if worst > 2000:
         print(f"  !! {worst:.0f} ms stall -- Windows closes a window unresponsive for ~5 s")
+
+    counts = {phase: sum(c.values()) for phase, c in exc.items()}
+    if any(counts.values()):
+        print("  script exceptions: " + ", ".join(f"{phase} {n}" for phase, n in counts.items()))
+        for phase, c in exc.items():
+            if c:
+                print(f"    {phase}: " + ", ".join(f"{src} {n}" for src, n in c.most_common(5))
+                      + (f", and {len(c) - 5} more sources" if len(c) > 5 else ""))
 
 
 def compare(a, b):
@@ -438,12 +563,16 @@ def compare(a, b):
 
 
 def main():
-    if len(sys.argv) < 2:
+    args = sys.argv[1:]
+    from_load = "--from-load" in args
+    paths = [a for a in args if a != "--from-load"]
+    if not paths:
         print(__doc__)
         return 1
-    profiles = [profile(p) for p in sys.argv[1:]]
+    profiles = [profile(p, from_load) for p in paths]
     for p in profiles:
         report(p)
+        report_hitches(p)
         print()
     for p in profiles[1:]:
         compare(profiles[0], p)
