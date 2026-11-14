@@ -6,13 +6,24 @@ first-person shader stack, on this desktop.
 **Why it exists.** Viewpoint's shader pack alone exposes 68 settings, across 566 keys
 in `viewpoint-live.properties`. Guessing at that space is hopeless, and the mod's own
 telemetry makes guessing unnecessary: it logs **per-pass GPU and render-CPU costs**
-every few seconds. These two scripts turn that into a benchmark loop.
+every few seconds. These scripts turn that into a benchmark loop, and keep the
+evidence the game would otherwise throw away.
 
 ```
-python pzbench.py  <DebugLog.txt> [<DebugLog.txt> ...]   # profile, and compare runs
-python pzpreset.py --list | --diff P | --apply P         # change settings reproducibly
-python pztail.py   [--console]                           # keep a log the game would wipe
+python pztail.py   [--console] [--server] [--save-backups]   # keep a log the game would wipe
+python pzbench.py  [--from-load] <log> [<log> ...]           # profile, hitches, compare runs
+python pzauto.py   [--once]                                  # report each finished session
+python pzpreset.py --list | --diff P | --apply P             # change settings reproducibly
+python pzconfig.py --bench | --play | --show                 # uncapped bench vs play profile
+python pzproc.py   [--report CSV]                            # client handles/GDI over a session
+python pzsavebackup.py                                       # zip the newest single-player save
+uv run --script pzserverstats.py                             # server JVM heap/GC/safepoints
 ```
+
+`--server` and `pzserverstats.py` are for the PC that hosts a co-op server, and came
+from that PC's own lane. `pzserverstats.py` needs `psutil` (declared inline, so `uv`
+fetches it) and, for its JVM columns, a JDK's `jcmd`, which the game does not ship.
+Everything else is the standard library only.
 
 Started 2026-11-04 after two `AppHangB1` hangs entering first person. No remote, per
 the host convention in `~/src/desktop-admin/CLAUDE.md` — local history so the
