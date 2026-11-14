@@ -1,6 +1,6 @@
 """pzsavebackup -- zip the single-player save after every clean game exit.
 
-Used by pztail.py (on by default; --no-save-backups turns it off) and runnable by hand:
+Used by `pztail.py --save-backups` and runnable by hand:
     python pzsavebackup.py            back up the most recently played single-player save now
 
 Why: a power cut on 2026-11-13 left chunk files of the last save full of zeros (the OS had not

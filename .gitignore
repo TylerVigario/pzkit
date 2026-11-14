@@ -18,3 +18,7 @@ __pycache__/
 !/reports/.gitkeep
 !/reports/INDEX.md
 captures/*_process.csv
+
+# Zipped single-player saves from pzsavebackup.py (pztail --save-backups). They are
+# copies of your saves: private, large, and never history.
+/save-backups/

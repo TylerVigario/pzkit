@@ -8,13 +8,30 @@ Writes captures/serverstats_<date>.csv (one row per minute per process found):
   time, role (server|client), pid, cpu_pct (of one core, averaged over the minute),
   rss_mib, private_mib, threads, and for the server JVM (via jcmd, read-only attach):
   heap_used_mib, heap_committed_mib, gc_young_count, gc_young_ms, gc_old_count, gc_old_ms,
-  safepoint_ms.
+  safepoint_ms, safepoints, safepoint_sync_ms.
 
 Run:  uv run --script pzserverstats.py          (uvw for no console window)
 Nothing is written while the game is not running.
+
+The JVM columns need jcmd, which comes with a JDK and NOT with the game: the JRE that
+Project Zomboid bundles in jre64/bin has java.exe, javaw.exe, jfr.exe and ten other
+tools, but no jcmd and no jstat (build 42.22). It is looked for in $JAVA_HOME/bin, then
+on PATH, then under C:/Program Files/Eclipse Adoptium. Without it the process columns
+are still written and the JVM ones stay empty.
+
+The JVM columns are filled for the server only, on purpose. On the client, Windows 10+
+gets Shenandoah by default on 42.22, and its counters do not map onto young/old: jstat
+reported YGC 0 with every cycle counted as FGC. Client GC numbers from here would read
+as a full-GC storm that is not happening.
+
+pzproc.py is the client-side counterpart and asks a different question: handles, GDI
+and USER objects over one session, to test the client for a leak. This one is a
+long-running, per-day record of the server.
 """
 import csv
+import os
 import re
+import shutil
 import subprocess
 import time
 from datetime import datetime
@@ -25,10 +42,20 @@ import psutil
 HERE = Path(__file__).resolve().parent
 CAPTURES = HERE / "captures"
 INTERVAL = 60
-JCMD = None
-for cand in sorted(Path(r"C:\Program Files\Eclipse Adoptium").glob("jdk-*/bin/jcmd.exe"), reverse=True):
-    JCMD = str(cand)
-    break
+
+
+def find_jcmd():
+    home = os.environ.get("JAVA_HOME")
+    if home and (Path(home) / "bin" / "jcmd.exe").is_file():
+        return str(Path(home) / "bin" / "jcmd.exe")
+    if shutil.which("jcmd"):
+        return shutil.which("jcmd")
+    for cand in sorted(Path(r"C:\Program Files\Eclipse Adoptium").glob("jdk-*/bin/jcmd.exe"), reverse=True):
+        return str(cand)
+    return None
+
+
+JCMD = find_jcmd()
 
 FIELDS = ["time", "role", "pid", "cpu_pct", "rss_mib", "private_mib", "threads",
           "heap_used_mib", "heap_committed_mib", "gc_young_count", "gc_young_ms",

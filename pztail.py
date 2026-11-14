@@ -41,13 +41,29 @@ Hence: copy the bytes out as they are written, and survive the truncate.
     python pztail.py                 # follow the live session, Ctrl-C to stop
     python pztail.py --once          # one catch-up pass, then exit
     python pztail.py --console       # also follow console.txt (its own 10 MB budget)
+    python pztail.py --server        # also follow the co-op server's own DebugLog
+    python pztail.py --save-backups  # zip the single-player save after each clean exit
 
 Captures land in captures/<logname>.full.txt and are append-only. pzbench.py reads
 them directly -- it keys off lines containing "gpu ms floors" and ignores the seam
 markers this writes.
+
+A RESTART RESUMES, IT DOES NOT START OVER. Each capture keeps its read position in
+captures/<capture>.state.json, so pztail stopped by a crash, a logoff or a logon
+task picks up where it was instead of appending the whole log a second time. The
+anchor check still catches a log that was truncated or replaced while pztail was not
+running. A capture that exists with no state file beside it (one written before the
+state file did) cannot be resumed; it gets a seam marker saying the text after it
+may repeat what came before.
+
+--server is for the PC that hosts a co-op server. The server writes its own
+*_DebugLog-server.txt next to the client's, and that is where server-side profilers
+such as ServerTickProfiler's [TickProf] lines land. --save-backups is off unless
+asked for, because it writes zips of your saves; pzsavebackup.py says what it does.
 """
 
 import argparse
+import json
 import sys
 import time
 from datetime import datetime
@@ -75,6 +91,12 @@ def newest_loose_log():
     return max(files, key=lambda p: p.stat().st_mtime) if files else None
 
 
+def newest_server_log():
+    """The co-op server's DebugLog, which sits beside the client's when this PC hosts."""
+    files = [p for p in LOGS.glob("*_DebugLog-server.txt") if p.is_file()]
+    return max(files, key=lambda p: p.stat().st_mtime) if files else None
+
+
 class Follower:
     """Follows one file, appending everything it ever contains to one capture."""
 
@@ -86,6 +108,30 @@ class Follower:
         self.resets = 0
         self.copied = 0
         dest.parent.mkdir(exist_ok=True)
+        # Resume from the last saved position. poll()'s size and anchor checks
+        # still catch a log that was truncated or replaced while we were stopped.
+        self.state = dest.with_name(dest.name + ".state.json")
+        resumed = False
+        try:
+            st = json.loads(self.state.read_text(encoding="utf-8"))
+            if st.get("src") == str(src):
+                self.offset = int(st["offset"])
+                self.anchor = bytes.fromhex(st["anchor"])
+                self.resets = int(st.get("resets", 0))
+                resumed = True
+        except (OSError, ValueError, KeyError):
+            pass
+        if not resumed and dest.exists() and dest.stat().st_size > 0:
+            self._note(f"{datetime.now():%Y-%m-%d %H:%M:%S} restarted with no saved "
+                       f"position -- what follows may repeat text already above")
+
+    def _save_state(self):
+        try:
+            self.state.write_text(json.dumps({"src": str(self.src), "offset": self.offset,
+                                              "anchor": self.anchor.hex(), "resets": self.resets}),
+                                  encoding="utf-8")
+        except OSError:
+            pass
 
     def _note(self, text):
         with open(self.dest, "ab") as out:
@@ -140,6 +186,9 @@ class Follower:
         self.offset += len(chunk)
         self.copied += len(chunk)
         self.anchor = chunk[-ANCHOR:] if len(chunk) >= ANCHOR else (self.anchor + chunk)[-ANCHOR:]
+        # After the append, not before: a crash between the two repeats one chunk
+        # on restart rather than losing it.
+        self._save_state()
         return len(chunk)
 
     def headroom(self):
@@ -151,22 +200,7 @@ class Follower:
         return PZ_TRUNCATE_AT - size
 
 
-def main():
-    ap = argparse.ArgumentParser(description=__doc__,
-                                 formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--once", action="store_true",
-                    help="single catch-up pass over the current log, then exit")
-    ap.add_argument("--console", action="store_true",
-                    help="also follow ~/Zomboid/console.txt (separate 10 MB budget)")
-    ap.add_argument("--interval", type=float, default=2.0,
-                    help="poll seconds (default 2; the log grows ~35 KB/min, so this "
-                         "is three orders of magnitude faster than it needs to be)")
-    a = ap.parse_args()
-
-    src = newest_loose_log()
-    if src is None:
-        sys.exit(f"no *_DebugLog.txt in {LOGS} -- has the game ever been run?")
-
+def build_followers(src, a):
     followers = [Follower(src, CAPTURES / (src.stem + ".full.txt"))]
     if a.console:
         c = ZOMBOID / "console.txt"
@@ -174,6 +208,45 @@ def main():
             followers.append(Follower(c, CAPTURES / f"{src.stem}.console.full.txt"))
         else:
             print(f"  no {c}, skipping --console")
+    if a.server:
+        s = newest_server_log()
+        if s is not None:
+            followers.append(Follower(s, CAPTURES / (s.stem + ".full.txt")))
+    return followers
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__,
+                                 formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--once", action="store_true",
+                    help="single catch-up pass over the current log, then exit")
+    ap.add_argument("--console", action="store_true",
+                    help="also follow ~/Zomboid/console.txt (separate 10 MB budget)")
+    ap.add_argument("--server", action="store_true",
+                    help="also follow the newest *_DebugLog-server.txt (the PC hosting co-op)")
+    ap.add_argument("--save-backups", action="store_true",
+                    help="zip the single-player save after each clean game exit (pzsavebackup.py)")
+    ap.add_argument("--interval", type=float, default=2.0,
+                    help="poll seconds (default 2; the log grows ~35 KB/min, so this "
+                         "is three orders of magnitude faster than it needs to be)")
+    a = ap.parse_args()
+
+    saver = None
+    if a.save_backups and not a.once:
+        try:
+            if str(HERE) not in sys.path:
+                sys.path.insert(0, str(HERE))
+            from pzsavebackup import SaveBackup
+            saver = SaveBackup()
+            print("  single-player save backup after each clean exit: on")
+        except Exception as e:
+            print(f"  save backups unavailable: {e}")
+
+    src = newest_loose_log()
+    if src is None:
+        sys.exit(f"no *_DebugLog.txt in {LOGS} -- has the game ever been run?")
+
+    followers = build_followers(src, a)
 
     for f in followers:
         print(f"  following {f.src}")
@@ -186,27 +259,37 @@ def main():
 
     print(f"  polling every {a.interval:g}s. Ctrl-C to stop.\n")
     watched = src
+    watched_server = newest_server_log() if a.server else None
     try:
         while True:
             for f in followers:
                 f.poll()
 
             # A new session rotates the old log away and starts a new loose file.
+            # The server's log rotates on its own schedule, so either one changing
+            # rebuilds the set; the saved positions keep the unchanged one in place.
             now = newest_loose_log()
-            if now is not None and now != watched:
-                print(f"\n  new session: {now.name}", flush=True)
-                watched = now
-                followers = [Follower(now, CAPTURES / (now.stem + ".full.txt"))]
-                if a.console and (ZOMBOID / "console.txt").exists():
-                    followers.append(Follower(ZOMBOID / "console.txt",
-                                              CAPTURES / f"{now.stem}.console.full.txt"))
+            now_server = newest_server_log() if a.server else None
+            if (now is not None and now != watched) or (now_server != watched_server):
+                print(f"\n  new session: {now.name if now else '?'}"
+                      f"{' / ' + now_server.name if now_server else ''}", flush=True)
+                watched, watched_server = now or watched, now_server
+                followers = build_followers(watched, a)
                 for f in followers:
                     print(f"  following {f.src.name} -> {f.dest.name}", flush=True)
 
-            head = followers[0].headroom()
-            if head is not None and head < 512 * 1024:
-                print(f"  [{datetime.now():%H:%M:%S}] game is {head:,} B from its own "
-                      f"truncate point -- capture has it", flush=True)
+            for f in followers:
+                if f.src.name == "console.txt":
+                    continue
+                head = f.headroom()
+                if head is not None and head < 512 * 1024:
+                    print(f"  [{datetime.now():%H:%M:%S}] {f.src.name} is {head:,} B from its own "
+                          f"truncate point -- capture has it", flush=True)
+            if saver is not None:
+                try:
+                    saver.poll()
+                except Exception as e:
+                    print(f"  [save-backup] poll error: {e}", flush=True)
             time.sleep(a.interval)
     except KeyboardInterrupt:
         print()
