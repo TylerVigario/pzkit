@@ -432,10 +432,14 @@ def report(p):
     last = steady[-1]
     if "vram_total" in last:
         used = last["vram_total"] - last["vram_free"]
+        # Viewpoint's eviction count is per stat window, not a running total: it
+        # falls as well as rises. Runs of equal values (2,2,2,2,2) suggest windows
+        # longer than the sample interval, so a sum would count one event several
+        # times. Neither the sum nor the max is a session total; say which this is.
         ev = max(s.get("evictions", 0) for s in steady)
         evm = max(s.get("evicted_mib", 0) for s in steady)
         print(f"\n  VRAM {used:.0f} / {last['vram_total']:.0f} MiB used"
-              f"   evictions {ev:.0f} ({evm:.0f} MiB)")
+              f"   evictions: at most {ev:.0f} in one stat window ({evm:.0f} MiB)")
     if "heap_cap" in last:
         print(f"  heap {last['heap_used']:.0f} / {last['heap_cap']:.0f} MiB"
               f"   process committed {last.get('committed', 0):.0f} MiB")

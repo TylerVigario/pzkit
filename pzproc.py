@@ -11,11 +11,11 @@ reports moves with them -- eleven counters sit at 1.00-1.13x in stall windows
 against all others -- and the Java heap is flat (-1% across the session, GC cycles
 median 0). So the growth is outside the JVM heap and outside Viewpoint.
 
-The host lane ran the equivalent check on its own machine and found no leak:
-private bytes 18.4-21.0 GB with no trend, threads steady at 151-153. That makes
-the same measurement here worth having, and comparable.
+The equivalent check on a second PC, the one hosting the co-op server, found no
+leak: private bytes 18.4-21.0 GB with no trend, threads steady at 151-153. That
+makes the same measurement on a client worth having, and comparable.
 
-A first reading on this client after 96 minutes: 38,680 handles, 115 threads,
+A first reading on one client after 96 minutes: 38,680 handles, 115 threads,
 15,658 MB private, 7,083 MB working set. The handle count is the one that looks
 like a rate rather than a level -- roughly 400/min if it started near zero -- but a
 single sample cannot show a trend, which is the whole reason for this file.

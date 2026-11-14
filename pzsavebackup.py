@@ -9,7 +9,7 @@ crash or power cut costs at most one session.
 
 How: when ~/Zomboid/console.txt ends a session with "GameThread exited." (a clean quit), wait
 until the most recently written save under ~/Zomboid/Saves/<mode>/<save> has been quiet for
-QUIET_S seconds, then zip it to pz-tuning/save-backups/<mode>_<save>/<timestamp>.zip and keep
+QUIET_S seconds, then zip it to save-backups/<mode>_<save>/<timestamp>.zip beside this script, keeping
 the newest KEEP. Multiplayer saves are skipped (the co-op server keeps its own startup backups).
 """
 import json

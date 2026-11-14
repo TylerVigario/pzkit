@@ -1,13 +1,31 @@
-# pz-tuning
+# pzkit
 
-Measurement-driven tuning for Project Zomboid Build 42 with the Viewpoint
-first-person shader stack, on this desktop.
+Measurement tools for **Project Zomboid Build 42** on Windows. They keep the logs the
+game deletes, turn the Viewpoint mod's telemetry into benchmarks that can tell a real
+change from noise, read each hitch by what caused it, back up single-player saves, and
+watch a co-op server's JVM.
 
-**Why it exists.** Viewpoint's shader pack alone exposes 68 settings, across 566 keys
-in `viewpoint-live.properties`. Guessing at that space is hopeless, and the mod's own
-telemetry makes guessing unnecessary: it logs **per-pass GPU and render-CPU costs**
-every few seconds. These scripts turn that into a benchmark loop, and keep the
-evidence the game would otherwise throw away.
+They exist because almost every way of getting this wrong is silent. The game wipes
+its own log mid-session, rewrites its config files on exit, and caps frame time
+without saying so. A counter can reset under you, too. Each tool below is built
+around one of those, and the section after the table says which.
+
+Written against Build 42.21 and 42.22. `pztail`, `pzsavebackup`, `pzproc` and
+`pzserverstats` work with or without Viewpoint; `pzbench`, `pzauto`, `pzpreset` and
+`pzconfig` read or write its files.
+
+## Requirements
+
+- Windows. Several tools ask `tasklist` or PowerShell whether the game is running.
+- Python 3.11 or newer. Everything uses the standard library only, except
+  `pzserverstats.py`, which declares `psutil` inline so that `uv run --script`
+  fetches it.
+- For the JVM columns of `pzserverstats.py`, a JDK's `jcmd`. The game does not ship
+  one: its bundled `jre64/bin` has `java.exe`, `javaw.exe` and `jfr.exe` among others,
+  but no `jcmd` and no `jstat`.
+- The game's user folder at `~/Zomboid`, which is the default.
+
+## The tools
 
 ```
 python pztail.py   [--console] [--server] [--save-backups]   # keep a log the game would wipe
@@ -20,737 +38,188 @@ python pzsavebackup.py                                       # zip the newest si
 uv run --script pzserverstats.py                             # server JVM heap/GC/safepoints
 ```
 
-`--server` and `pzserverstats.py` are for the PC that hosts a co-op server, and came
-from that PC's own lane. `pzserverstats.py` needs `psutil` (declared inline, so `uv`
-fetches it) and, for its JVM columns, a JDK's `jcmd`, which the game does not ship.
-Everything else is the standard library only.
+Every script explains itself in its docstring, including why it exists and what it
+cannot tell you. `--server` and `pzserverstats.py` are for the PC that hosts a co-op
+server. Example presets, and how to make your own, are in
+[`presets/`](presets/README.md).
 
-Started 2026-11-04 after two `AppHangB1` hangs entering first person. No remote, per
-the host convention in `~/src/desktop-admin/CLAUDE.md` — local history so the
-reasoning survives, publishing is a separate decision.
+## What the game does that these tools work around
 
----
+### It deletes its own log at 10 MB, mid-session, with no backup
 
-## The problem it was built for, and how it was actually diagnosed
+This is not rotation: the earlier part is simply gone. From `zombie/core/logger/ZLogger`
+in `projectzomboid.jar` (42.21.0):
 
-Reported as "crashes a lot, just crashed going into first person mode".
+```java
+static final long s_maxSizeKo = 10000;
 
-**It was not crashing.** Windows Application log, Event 1002 `AppHangB1`:
-*"ProjectZomboid64.exe stopped interacting with Windows and was closed."* Twice,
-13:48 and 14:04 on 2026-11-04, and those are the **only two ever recorded**.
-
-Ruled out by looking, not by reasoning:
-
-| Suspect | Evidence against |
-|---|---|
-| GPU driver timeout (TDR) | zero `nvlddmkm` / 4101 events in 3 days |
-| Java heap OOM | heap 1859 of 2747 MiB, no `hs_err`, no OOM in log |
-| VRAM exhaustion | 3.4 GB free at the hang; 7 evictions totalling 96 MiB |
-| Hardware | 31.8 GB RAM, RTX 4070 Ti 12 GB |
-
-**The cause.** Both hangs stop dead on a `[TrueWeathers]` shader-injection line,
-moments after the iso → first-person transition rebuilds Viewpoint's deferred
-pipeline. TrueWeathers had taken over the shader pack and rewritten the preset:
-
-```
-[TrueWeathers] shader pack: selected True Weathers & Lighting (was 'default').
-               Turn "Use the True Weathers shader pack" off in Mod Options...
-[Viewpoint]    trueweathers's preset High: its values changed, written again.
+void checkSizeUnsafe() {
+    if (this.file.length() / 1024L > s_maxSizeKo) recreateLogFileUnsafe();
+}
+void recreateLogFileUnsafe() {
+    this.outputStreams.file.close();
+    this.file = new File(LoggerManager.getLogFilePath(this.name));
+    this.outputStreams.file = new PrintStream(this.file);   // truncates
+}
 ```
 
-That forces a full shader recompile, synchronously, on the main thread. The window
-stops pumping messages and Windows closes it after ~5 s. **The game was never
-crashing — it was busy.**
+It fires at **10,241,024 bytes** exactly (integer division: the first length whose
+`length/1024` exceeds 10000), then reopens a `PrintStream` on the same path, which
+truncates it. A four-hour session can be left with its last six minutes.
 
-Worst pipeline-build frame went **2,678 ms → 349 ms** once the pack was reined in,
-and a 25-minute first-person session produced zero hangs.
+**There is nothing to configure.** `s_maxSizeKo` is `static final`, a compile-time
+constant, with no system property, launch flag or `debuglog.cfg` key behind it. Cutting
+log volume does not get you far either: with Viewpoint running, its own stat line was
+82% of the bytes in one measured session, and that line is the data worth keeping.
 
----
+Two more things about the logs:
 
-## What the profile says
+- On launch the game moves the **previous** run's logs into `Logs/logs_<timestamp>/`,
+  so an older session's log is in a subfolder, not loose in `Logs/`.
+- `console.txt` is a separate logger with its own 10 MB budget, so it wipes at a
+  different moment.
 
-The baseline that matters is the **controlled** one — standing still, warmup ramp
-discarded, 2026-11-04 15:15 and 15:19, reproducible to 0.08 ms:
+**`pztail.py`** copies the bytes out as they are written into `captures/`, survives each
+truncate (including one that refills past the old position between two polls, which
+a 256-byte anchor check catches), and resumes after its own restart rather than
+appending the whole log twice. Run it before you play.
 
-```
-main frame median  7.22 ms  ->  138 fps
-gpu median         5.91 ms  ->  would support 169 fps
+### It rewrites its config files when it exits
 
-LIMITER: MAIN THREAD   (1.31 ms of GPU headroom unused, 19x the resolution)
-```
+`options.ini` and Viewpoint's `viewpoint-live.properties` are both written back from
+memory on exit, so an edit made while the game runs is lost, and the next benchmark
+says the setting did nothing. **`pzpreset.py`** refuses to run while the game is up. It
+edits line by line, so the 566 keys keep their order and the file keeps its CRLF
+endings and header. It treats an unknown key as an error rather than a silent no-op,
+and it backs up every file before writing it.
 
-Under **actual play** it is 9.36 ms / 107 fps, and at hour 4 of a session that is
-still main-thread bound with the GPU unchanged at 5.72 ms. Playing costs ~2.1 ms of
-main thread; the GPU does not notice.
+**`pzconfig.py`** switches between an uncapped bench profile and your play profile. It
+edits only `vsync`, `uncappedFPS` and the frame-caps file's `game` key, for the same
+reason: a whole-file restore would revert your keybinds and volumes with it.
 
-Per-pass GPU cost, median, controlled run:
+### `options.ini` stores quality settings two opposite ways
 
-```
-sky+light   1.51  25.6%      glass    0.35
-gbuffer     1.19  20.1%      far      0.24
-shadow      1.02  17.2%      air      0.17
-post+taa    0.80  13.6%      bloom    0.06
-occlusion   0.49   8.3%      weather  0.04
-                             floors   0.03
-                             outlines 0.00
-```
+Verified against `media/lua/client/OptionScreens/MainOptions.lua`:
 
-**Only five passes cost anything.** Everything below `occlusion` is rounding error,
-so every setting feeding those passes is free — turn them up.
-
-And the main thread splits as `chunk cache 0.40 + far world 0.08 + snapshot 1.24`
-= **1.7 ms of Viewpoint**, leaving **~5.5 ms of base-game simulation**. Roughly 76%
-of frame time is the vanilla update loop, which no shader setting touches.
-
-### Which is why the search space collapses
-
-It is not a 68-dimensional optimisation. While the main thread is the limiter, the
-**entire GPU-side setting space is irrelevant to fps** — so:
-
-> Spend GPU headroom on looks until the GPU median approaches the main-thread median,
-> then stop. One number to walk up, not 2^68 combinations.
-
-Past that point, fps only moves via base-game main-thread settings (`options.ini`),
-sandbox population, or **the JVM** — which is neither of the two config files and was
-the lever this framing originally missed. See the hour-4 table.
-
----
-
-## What four hours of play does, which no short run shows
-
-From the last 6m20s of the 2026-11-04 15:23 session (3h58m in), against the fresh
-2-minute controlled runs. **This is where the remaining levers are.**
-
-| | fresh (2 min in) | hour 4 | |
-|---|---|---|---|
-| main frame median | 7.22 ms (138 fps) | 9.36 ms (107 fps) | −22%, and real (3.5× resolution) |
-| GPU median | 5.91 ms | 5.72 ms | unchanged — **still not the limiter** |
-| Shenandoah **cycles** / 10 s | 3 | **21** | **7× the collection rate** |
-| Shenandoah pauses / 10 s | 12 in 1 ms | 84 in 6 ms | still trivial as *pause* time |
-| heap | 2335 / 3072 MiB | 2696 / **3067** MiB | cap ratcheted to the `-Xmx` ceiling |
-| VRAM used | 7727 / 12282 MiB | **11448** / 12282 MiB | 834 MiB free; first evictions appear |
-| commit charge | 13.8 GB | 18.5 GB | fine on 31.8 GB |
-
-**The GC finding is the strongest lever on the board, and it corrects an earlier
-call.** `-Xmx` was written off here as "hygiene, it will not raise fps", on the
-strength of `Shenandoah Pauses 16 in 1 ms` from a 25-minute run. That reading of
-*pause* time was right and the conclusion was wrong: the measurement was simply taken
-too early in a session to see the problem. At hour 4 the live set is ~2.7 GB against a
-3.07 GB cap, leaving ~370 MB of allocation headroom, so Shenandoah runs a **full cycle
-every ~480 ms, continuously**. Pause time stays negligible because Shenandoah is
-concurrent — but concurrent means its marking and evacuation threads compete for CPU
-*with the main thread*, which is the limiter here.
-
-**`-Xmx3072m` → `6144m` is applied and verified.** Applied 2026-11-09, backed up to
-`ProjectZomboid64.json.pretune-2026-11-09T090752`; only `-Xmx` was touched. Measured
-across three sessions on 2026-11-11:
-
-| per 10 s | `-Xmx3072m` | `-Xmx6144m` |
+| keys | stored as | so the best setting reads |
 |---|---|---|
-| Shenandoah cycles | median **21**, max 34 | median **0** |
-| concurrent GC work | median **8.7 s**, max 12.4 s | median **0 ms** |
-| heap used | 2,591 of ~3,000 — pinned at the ceiling | 3,635 of ~5,550 |
+| `water`, `puddles`, `perfPuddles`, `fogQuality`, `perfSkybox` | combo index, applied as `selected - 1`; the first entry is the best | `0` |
+| `maxTextureSize`, `maxVehicleTextureSize` | 1-based, no offset | the highest number |
+| `bPerfReflections` | plain boolean | `true` |
 
-8.7 seconds of collector work per 10 seconds of wall clock is roughly a core running
-continuously, and it tracked straight into frame time: 7.89 ms at 15 cycles, 11.17 ms
-at 24, back to 7.60 ms when it dipped to 21. **The heap was simply smaller than the
-working set** — 3,635 MiB cannot fit in a 3,072 MiB ceiling, which is the whole bug
-and the one inference that needs no other controls.
+Reading those `0`s as "off" sends you looking for headroom in `options.ini`, where
+there may be none.
 
-**It does not take hour 3 to see.** The old config was already at 15 cycles/10 s inside
-its first ten minutes and 21 by minute 20, so a 25-minute session is sufficient. The
-"3 cycles when fresh" figure came from too early a sample.
+### A frame cap turns frame time into a ceiling
 
-**Confounds that were checked rather than assumed.** MPOptimizer was absent from the
-2026-11-04 run and present on 2026-11-11, and it installs its own "Memory & Garbage
-Collection Manager" — so the first comparison had two new variables plus
-single-player → multiplayer. Removing it changed nothing: GC stayed at median 0 cycles
-with the mod gone, so the collector manager contributed nothing and `-Xmx` is the cause.
-Separately, the collector itself is **Shenandoah by Viewpoint's edit, not the game's
-default** — vanilla selects ZGC on the Windows 10/11 key. The thrash was therefore
-Shenandoah's behaviour at a 3 GB ceiling; ZGC at 3072m was never tried and does not
-need to be.
+`vsync`, `frameRate`, a `viewpoint-frame-caps.properties` with no `game` line (which
+its own header says means the monitor's refresh rate), and Viewpoint's
+`graphics.frameGeneration` all pin frame time. Frame generation was seen holding one
+PC flat at 33.33 ms. A capped run shows a hard floor, with no sample below
+`1000 / refresh rate` ms, and its median is that ceiling, not a measurement. Two
+capped runs compared against each other test nothing.
 
-**VRAM eviction is a real cost, and it is not the card filling up.** Measured
-2026-11-11 across three sessions: eviction events fire at **45–76% card occupancy**,
-and **13 of 40 main-thread stalls land within 1.5 s of one — 65× what chance gives**
-(tested against 2,000 randomised placements over the same span). The stalls run
-130–280 ms with Viewpoint attributing only **1.4 ms** of each to itself; the rest is
-the game re-uploading what the driver dumped. Worst observed 265 ms while standing
-still.
+**`pzbench.py`** detects a floor and refuses to compare two ceilings. What it still
+reports under a cap is what a cap cannot clamp:
+- per-pass GPU ms, which come from GPU timer queries
+- evictions, the heap and the slow-frame log
+- the share of frames that miss the cap
 
-The mechanism is the Windows GPU memory **budget**, not capacity. Measured during play:
-PZ holds 3,933 MB while other processes hold **3,005 MB** — `dwm` alone 1,735 MB. The
-manager sizes each process's budget against the others, so PZ is evicted while 6.7 GB
-of the card reads "free". The lever is therefore *fewer resident competitors*, not
-lower texture settings.
+`python pzconfig.py --bench` takes the cap off. The proof that it worked is the floor
+moving, not either script saying so.
 
-`options.ini` texture levers: `texture2x=true`, `maxTextureSize=4`,
-`maxVehicleTextureSize=4`, and `textureCompression=true` — the last one changed by
-MPOptimizer rather than chosen. See **Open**.
+### The first minute and a half is not steady state
 
-**The hitches are bursts, not a rate — and the earlier hypothesis was wrong.** 22 slow
-main-thread frames in 6m20s, but **17 of them inside one 8-second window**
-(19:18:22–30), with 21 of the 31 slow *render*-thread frames in the same window. The
-`shadow` GPU pass tripled across it, 0.97 → 1.64 → 2.21 ms, while fps fell to 67.
-That is a sudden crowd of shadow casters, not shader variants compiling and not a
-texture-streaming stall — this file was four hours into the session, long past any
-cold cache. Worst frame 136 ms, well clear of a hang.
+Entering first person builds Viewpoint's deferred pipeline, which costs one frame
+measured in seconds (2,678 ms in one case). Then frame time falls for another 60 to 90
+seconds before it settles.
+Counting that ramp as noise once overstated the noise band eightfold (1.16 ms against
+0.17 ms), which made real changes look unmeasurable. `pzbench` drops both, and it
+judges a change against `band / √n`, the resolution of a median of n samples, rather
+than against the spread of single samples.
 
-**There are two hitch classes and they need separating.** That 8-second burst is one:
-a crowd of shadow casters, where the `shadow` pass itself triples and shadow settings
-are the lever. The other is the recurring kind measured 2026-11-11 — roughly one every
-25–69 seconds, median 177–198 ms, with Viewpoint's own work at 1.4 ms and the cost in
-GPU-memory eviction. Shadow settings do nothing for the second kind. **The attribution
-in each `slow frame on the main thread` line is what tells them apart:** a large `ours`
-is the mod's own work, a small `ours` with a large remainder is the game re-uploading,
-the renderer, or the server. Reading the median instead of the attribution is what kept
-this confused for a week.
+### A hitch has to be read by its attribution, not its size
 
-## The passenger stop-and-shake, and the curve underneath it
-
-Tyler reported for weeks that the car does a "stop and shake" when he rides as a
-passenger. It was diagnosed 2026-11-11 and it is **not a network problem**, which is
-where everyone looks first.
-
-**The question that cracked it was "is there rubber banding?" and the answer was no.**
-A car whose authoritative position arrives late snaps to a corrected place when it
-catches up. This one freezes and resumes from the same spot. That rules out position
-correction entirely, and it points at a local freeze — which is what the client log had
-been recording all along as `slow frame on the main thread`.
-
-**The stalls are a hump, not a climb, and neither elapsed time nor explored area
-explains them.** Measured over the complete 135-minute session: 43 steady-state stalls,
-0.32/min.
-
-| elapsed | stalls | median | worst | chunks by then |
-|---|---|---|---|---|
-| 0–15 | 6 | 156 ms | 233 | 2,008 |
-| 15–30 | 12 | 225 ms | 269 | 6,665 |
-| 30–45 | 6 | **272 ms** | 302 | 7,208 |
-| 45–60 | 0 | — | — | 7,228 |
-| 60–75 | 7 | 188 ms | 321 | 8,072 |
-| 75–90 | 0 | — | — | 8,985 |
-| 90–105 | 6 | **54 ms** | 104 | 11,942 |
-| 105–120 | 6 | 78 ms | 300 | 14,345 |
-| 120–150 | 0 | — | — | 16,558 |
-
-They rise to a peak around 30–45 minutes and then fall away, stopping entirely for the
-last half hour. **Spearman rho against elapsed time over the whole session is −0.273** —
-negative.
-
-**Explored area is dead as a driver, decisively.** `map layouts` tripled from 35,073 to
-103,714 between the stally and quiet halves while median stall size fell from 217 ms to
-55 ms, and `remembered chunks` more than doubled from 7,228 to 16,558 across a stretch
-containing almost no stalls at all. A quantity that triples while the symptom quarters is
-not causing the symptom.
-
-**Nothing else separates the two halves.** Chunk loading rate, zombies loaded, draws per
-frame, frame time, heap and committed bytes are flat across both. Neither client leaks
-(see `pzproc.py`), the heap is flat, GC cycles are median 0, and no counter Viewpoint
-reports moves with the stalls. **The mechanism is unknown and no current hypothesis
-survives.**
-
-**A 63-minute window gave the opposite answer**, which is the methodological point worth
-keeping: over the first 63 minutes the same measurement produced rho +0.599 against
-elapsed time, chunks and map layouts alike, all three collinear at rho 1.000. The curve
-had simply not turned over yet. A monotonic trend measured inside half a session is not a
-trend, and the +0.599 was real for that window and false for the session.
-
-**The stand-still run, done 2026-11-11 16:10:29–16:34:24.** 24 minutes parked, with
-`remembered chunks` holding at **16,558 → 16,558** — zero map loading, a clean
-stand-still. Three stalls: 209.5 ms at 16:25:57, then 147.2 and 191.3 ms at 16:34:17 and
-16:34:24, which coincide with the game closing and are discarded as shutdown work.
-
-That leaves **a 209.5 ms stall while stationary, with nothing loading and nothing
-happening**, and it settles two things:
-
-- **Magnitude is independent of activity.** 209 ms parked sits inside the 147–300 ms
-  range from the active periods. Stopping does not make them smaller.
-- **Frequency is not.** One clean stall in ~15 minutes of undisturbed parking against
-  0.32/min across the session. Activity makes them more frequent, not bigger.
-
-So travel, map loading and player activity are eliminated as causes. The process sampler
-over the same window is flat — handles +3, threads 0, private −2%, working set −6% —
-which matches the host lane's result on its own machine and kills resource growth on both.
-
-One refinement to the paragraph above: explored area is dead as a **growth** driver, but
-16,558 chunks were still **resident** while parked, so explored area as a *level* is not
-excluded. A periodic sweep over resident state would stall whether the player moves or
-not. The hump shape argues against it; it is not dead the way the growth story is.
-
-**The next run needs no second machine.** Stalls happen parked and idle, so they should
-reproduce in single player — which removes the server, the network, the other client and
-vehicle sync in one step. Load any single-player save, stand still 20 minutes, quit. Not
-yet done.
-
-**Ruled out, both ends.** The host lane ran the server-side exclusions:
-
-| suspect | how it was cleared |
-|---|---|
-| server hitches ≥500 ms | **0 of 21** stall windows overlap any of 54 logged 13:49–14:22 |
-| server GC | first young GC after a 10,711 → 2,535 MiB climb paused **54.5 ms**, about half a tick |
-| server safepoints | 27 totalling 90.4 s, but the count did not move across five per-minute samples during play — startup, not play |
-| driver frame rate | host went from 30 fps (frame generation) to a real 60; symptom "roughly the same" |
-| client GC | cycles median 0, pause max 2 ms, heap median 3,601 MiB and **flat across the session at −1%** |
-| chunk building | 0.15 ms per build, `waiting in view` 0; the 9 ms main-thread budget is never touched |
-| Viewpoint's rendering | it attributes **0.8–2.2 ms** of each 200–290 ms stall to itself |
-| mod Lua errors | all 12 at load (13:49:06), from a music mod, none during play |
-
-**And nothing Viewpoint reports spikes at the moment of a stall.** Counter ratios in
-stall windows against all others run 1.00–1.13 across chunks, map lamps, light-main,
-band grids, room levels, compile, select, snapshot, cache, heap and committed. The work
-is in the base game's Java and it is invisible to every instrument here. **There is no
-client-side Lua profiler** — the host's returns at `if not isServer()` by design — so
-client mod cost is currently unmeasurable, which is the obvious gap to close next.
-
-GPU-memory eviction explains **5 of 21** at ×10 chance, so it is a real but partial
-contributor and cannot carry a curve that triples.
-
-**The workaround, until there is a fix:** a client restart resets it. The first ten
-minutes are at 88 ms, which is barely perceptible.
-
-## Three ways a counter lied, all on the same day
-
-All three produced a confident wrong answer that survived until something else
-contradicted it.
-
-**An eviction counter that resets.** `evictions N (M MiB)` in the stat line is a
-per-window count, not a running total, so reading its maximum gives the biggest single
-window rather than the session. Summing the deltas: **13 events** in the 13-47 session,
-where `max()` said 4. The morning session is 14, not 3. Every eviction rate quoted from a
-maximum is low by roughly a factor of three.
-
-**`st:` IS a wall clock, once the zeros are dropped.** The console lines carry `st:` where
-the DebugLog carries a timestamp. Measured 2026-11-14 over the 13-47 capture: 5,006 lines
-read `st:0`, every one of them before the first nonzero reading, and across the other
-6,725 lines wall time minus `st` is constant to ±2 ms and `st` never runs backwards. So
-it is milliseconds from an arbitrary origin (6h25m at the first reading), and a console
-line's time is its `st` plus one offset read from any stamped DebugLog line of the same
-session. A regression that keeps the `st:0` lines gets a 23,000-second spread, which is
-what an earlier pass here took as proof that the field was meaningless. Whether `st`
-survives a quit to menu and reload inside one process is untested; that session loaded
-once.
-
-**A clock skew needs one reference, not two readings.** Reading each machine's clock and
-subtracting measures the gap between two *moments*, not between two clocks.
-`w32tm /stripchart /computer:time.windows.com /samples:4 /dataonly` on both, same server,
-same convention, does measure it: this machine +1.2696 s, the host +0.331 s, so
-
-    client − host = −0.939 s        host_time = client_time + 0.939 s
-
-steady to half a millisecond over four samples. That killed a live hypothesis: a ~4 s
-skew would have made a 963 ms server hitch cover two client stalls, and at 0.939 s the
-nearest server hitch starts **1.59 s after the client stall ends**.
-
-## Two index conventions in one options file
-
-`options.ini` stores the graphics quality settings two different ways, and both read as
-"at maximum" by opposite arithmetic. Verified 2026-11-11 against
-`media/lua/client/OptionScreens/MainOptions.lua`.
-
-| key | stored as | value here | means |
-|---|---|---|---|
-| `water` | combo index, `selected = v + 1` | `0` | **High** of {High, Medium, Low} |
-| `puddles` | same | `0` | **High** |
-| `perfPuddles` | same | `0` | **All** of {All, GroundWithRuts, GroundOnly, None} |
-| `fogQuality` | same | `0` | **High** of {High, Medium, legacy} |
-| `perfSkybox` | same | `0` | **High** of {High, Medium, No} |
-| `maxTextureSize` | 1-based, **no offset**: `selected = v` | `4` | **largest** of four |
-| `maxVehicleTextureSize` | same | `4` | **largest** |
-| `bPerfReflections` | plain bool, no index | `false` | **off** |
-
-The first group applies with `set…(box.selected - 1)` and the first combo entry is the
-best one, so a `0` is the *highest* setting. The second group applies with
-`set…(box.selected)` and no arithmetic at all, so a `4` is also the highest. Reading a
-`0` as "off" inverts the conclusion about where GPU headroom can be spent: it puts the
-floor in `options.ini`, where there is none, instead of in Viewpoint's shader pack,
-where 13 of 68 keys really are `false`.
-
-## Things measured and then found wrong
-
-Kept because the wrong version is instructive.
-
-- **`memory.minecraftMiB=6144` is a cap, not a reservation.** The pool reads
-  `Minecraft shaders 0/6144` — it holds nothing. Lowering it frees nothing. Viewpoint's
-  *entire* VRAM footprint is 182 MiB across all pools; the ~5.9 GB the game uses is
-  base-game textures. `textureCompression` is the real lever there.
-- **VRAM was never the problem.** 7 evictions / 96 MiB over a whole session is noise,
-  and 3.4 GB was free at the hang. It was listed alongside real causes, which was
-  padding.
-- **"GC was never the problem either" — withdrawn 2026-11-04.** That read
-  `Shenandoah Pauses 16 in 1 ms` off a 25-minute run and concluded `-Xmx` was hygiene
-  that "will not raise fps". The pause figure was correct; the conclusion was not. A
-  four-hour session shows **21 cycles per 10 s against 3 when fresh**, with the heap
-  pinned at the `-Xmx` ceiling. See the hour-4 table above. The error was reading a
-  steady-state property off a session that had not reached steady state — the same
-  mistake, in a different guise, as counting the warmup ramp as noise.
-- **"VRAM already in use" is the desktop**, not a leak: `dwm` 1820 MB,
-  PhoneExperienceHost 652 MB, msedge 459 MB, steamwebhelper 323 MB, and a tail of tray
-  apps. ~2.7 GB resident before the game starts.
-- **"CRLF on both sides" was a broken instrument, not a reading.** Comparing the Workshop
-  mod sources against the patched copies, `grep -c $''` reported every line of every
-  file as containing a CR, and that was taken as "consistent CRLF both sides". The mod
-  files are **LF only, with zero CR bytes** -- proven by SHA-256: the file sizes and
-  hashes match an LF file exactly, and a CRLF copy of a 575-line file would be 575 bytes
-  larger with a different hash. The quoting did not survive into the function that ran
-  the grep, so the pattern matched the letter `r` instead of a carriage return, and
-  almost every line of Lua contains an `r`. **A count equal to the line count is a
-  warning sign, not a confirmation** -- the same shape of error as a counter that resets
-  per window. Count bytes with `b"" in raw`, or check a hash, rather than grepping
-  for an escape.
-
----
-
-## Benchmark protocol
-
-Runs are only comparable if the scene is. Weather alone swings `sky+light` hard.
-
-### Step zero: measure the noise floor — done, 2026-11-04
-
-Two 2-minute runs on an **identical** config, standing still in first person, at
-15:15 and 15:19. This is the measurement the whole method rests on, and it answered
-the question in the method's favour:
+Viewpoint logs every slow frame with its own split:
 
 ```
-run A   median 7.22 ms   p10-p90 band 0.17 ms   n=6    resolution 0.07 ms
-run B   median 7.31 ms   p10-p90 band 0.25 ms   n=7    resolution 0.09 ms
-
-delta of medians 0.08 ms, against a resolution of 0.09 ms  ->  NOT A RESULT
+slow frame on the main thread: 626.2 ms, ours 538.7 (... by part: lights 290.6, ...), the rest 87.5
 ```
 
-Two independent runs of the same config land **0.08 ms apart** and the tool correctly
-declines to call that a difference. Against **~1.4 ms of GPU headroom**, that is a
-15:1 signal-to-noise ratio. **The loop works. Single settings are measurable.**
+A large `ours` is Viewpoint's own work, so its settings are the lever. A small `ours`
+with a large `rest` is not Viewpoint at all: on the main thread that means the game's
+update and the garbage collector, and on the render thread the game's own drawing or a
+wait on the main thread. A median of slow frames mixes those two classes and explains
+neither. The `HITCHES` block of `pzbench` counts how many fall on each side, names the
+parts, buckets the sizes and gives a rate.
 
-#### Two things that were wrong before this was measured
+Script exceptions are split at the first exit from `GameLoadingState`. Before it they
+are dominated by noise: a mod without an optional folder logs one `visitFileFailed`
+per missing path, 238 of 242 in one session. `--from-load` leaves that phase out
+altogether.
 
-**The band was never 1.46 ms — that figure was a warmup ramp counted as noise.**
-Frame time falls monotonically for ~60–90 s after the pipeline builds:
+### Three log fields that mislead if read naively
 
-```
-22.49 -> 8.37 -> 8.05 -> 7.69 -> 7.49 -> 8.07 -> 7.38 -> 7.44 -> 7.23 -> 7.22 -> 7.21
-|------------ ramp, ~60 s, discard -----------|------------ plateau -------------|
-```
+- **`st:` is a millisecond clock with an arbitrary origin, and reads `0` until it is
+  set.** Across one 165-minute capture, wall time minus `st` was constant to ±2 ms
+  once the `st:0` lines were dropped, and every one of those came first. Keep the
+  zeros in a fit and you get a spread of thousands of seconds.
+- **Viewpoint's `evictions N (M MiB)` is per stat window, not a running total.** It
+  falls as well as rises, and runs of equal values suggest windows longer than the
+  sample interval. So neither the sum nor the maximum is a session total, and
+  `pzbench` reports the maximum as exactly that: the most in one window.
+- **On the client, GC counters are misleading.** Windows 10 and later get the
+  Shenandoah collector by default on 42.22, and `jstat` then reports young-GC 0 with
+  every cycle counted as full GC. `pzserverstats` reads JVM counters from the server
+  only.
 
-with render CPU descending 13.5 → 5.6 → 5.4 → 5.3 alongside it. Including the ramp
-reports a 1.16 ms band; excluding it reports **0.17 ms** — an eightfold overstatement,
-which is what made real changes look unresolvable. `split_warmup` caught only the
-single pipeline-build sample (render CPU 3294 ms) and let the ramp through as steady
-state.
+### The client cannot see the server
 
-**The resolution of the benchmark is not the spread of its samples.** The comparison
-is between *medians*, and a median of n samples is steadier than one sample by
-roughly √n. Comparing a median delta against the sample band was too strict by that
-factor, and it is what produced the "1.3:1, marginal" verdict. `resolution()` now
-reports `band/√n`, which is about a 2σ threshold on the median — and the controlled
-pair above confirms it empirically.
+Every client-side metric here can look perfect while a co-op game is unplayable.
+That happened once: the server's simulation tick fell from about 10 a second to 0.2
+for twelve minutes, with the client at 165 fps and no slow frames. When the symptom
+is **delay**, with actions that do not register or a car that stops dead, measure the
+server first. **Stutter** is a frame-time problem and the client tools see it; delay
+is a simulation-rate problem and they cannot. The client log's per-minute counts of
+`EquipPacket.set get invalid arguments` and `player is not found` were the clue from
+that side. On the hosting PC, `pztail.py --server` keeps the server's own DebugLog,
+and `pzserverstats.py` records its heap, collections and safepoints.
 
-> **Retracted: "do not bench `01-restore-cheap`, it is under the floor."** The floor
-> is 0.07–0.09 ms on a controlled run, not ~1.5 ms. A 0.5 ms change is five times the
-> resolution and perfectly measurable. The only honest part of that advice was the
-> last clause — the question it really answers is whether the lens flares look better
-> to you, and that is still a matter for the eye.
+### A power cut can zero a save
 
-**Scene composition is a separate, real, and irreducible variance source.** Under
-actual play the band is 3.79 ms (n=39) even with weather constant. That is why runs
-are made standing still; it is not the same thing as the warmup ramp, and conflating
-the two is what caused the error above.
+The operating system had not written a save's last chunk files when the power went,
+and they came back full of zeros. **`pzsavebackup.py`** waits for a clean exit
+(`GameThread exited.` in `console.txt`) and for the newest single-player save to stop
+changing, then zips it, keeping the last five. Run it by hand, or let
+`pztail.py --save-backups` do it after every session. Multiplayer saves are skipped.
 
-### The loop
+## Benchmarking a setting
 
-0. `python pzconfig.py --bench` — take the frame cap off, or steps 5 and 6 measure
-   nothing. `--play` puts it back; `--show` says which profile is live. It edits only
-   `vsync`, `uncappedFPS` and the caps file's `game` key, in place, because the game
-   rewrites `options.ini` from memory on exit and a whole-file restore would quietly
-   revert keybinds and volumes along with the cap.
-1. `python pzpreset.py --snapshot my-baseline` — always have a way back.
-2. `--diff` the preset, then `--apply` it. **Game must be closed.**
-3. Launch, go to the *same* spot, same in-game time and weather, enter first person.
-4. Stand still **4–5 minutes**, not 2. The first ~90 s is the warmup ramp and gets
-   discarded, so a 2-minute run yields only 6–7 usable samples. 4–5 minutes leaves
-   ~18–24, and resolution improves as √n — roughly 0.07 ms → 0.04 ms.
-5. Quit, then `python pzbench.py <old log> <new log>`.
-6. **One change per run.** Two changes at once are unattributable.
+0. `python pzconfig.py --bench`: take the cap off, or steps 5 and 6 measure nothing.
+1. `python pzpreset.py --snapshot my-baseline`: always have a way back.
+2. `--diff` the preset, then `--apply` it, with the game closed.
+3. Launch and go to the **same** spot, at the same in-game time and weather. Enter
+   first person.
+4. Stand still for **4 to 5 minutes**. About 90 seconds of that is discarded, and
+   resolution improves as √n.
+5. Quit, then `python pzbench.py <before> <after>`. It says **NOT A RESULT** when a
+   difference is inside what the runs can resolve.
+6. **One change per run.** Two changes at once cannot be attributed.
 
-**Step 5 is the one that does not get done.** The 2026-11-04 session sat unanalysed for
-five days and `02-mainthread` was applied 2026-11-04 and never measured at all — both
-logs existed the whole time. So `pzauto.py` does it instead:
+Step 5 is the one that does not get done, so `pzauto.py` does it: it reports each
+session once the game has exited, its capture has been idle for 90 s, and no report
+exists. Each condition alone is wrong. No process is also true before launch, and a
+quiet capture is also true in a menu. It skips runs too short to measure rather than
+reporting a confident median over nothing, and keeps one line per session in
+`reports/INDEX.md`.
 
-```
-python pzauto.py            # watch; report each session as it ends
-python pzauto.py --once     # report any finished, unreported session now
-python pzauto.py --report <capture>
-```
+## Your data stays on your PC
 
-A session counts as over only when **all three** hold: no `ProjectZomboid64.exe`, its
-capture idle for 90 s, and no report written yet. Each alone is wrong — no process is
-also true *before* launch, and a quiet capture is also true in a menu. A failed
-`tasklist` is treated as "running", so a broken query cannot produce a mid-session
-report. Runs under 12 stat lines are skipped and recorded as skipped, because `pzbench`
-will otherwise state a confident median over nothing.
+`captures/`, `reports/`, `backups/` and `save-backups/` are written next to the scripts
+and are all gitignored. Keep it that way. Raw logs carry player and character names,
+server names, LAN addresses and Windows user paths, and the backups are copies of your
+config and your saves.
 
-Reports land in `reports/<session>.txt`, each compared against the previous session
-that produced one, and `reports/INDEX.md` carries one line per session so the trend is
-readable without opening any of them. The index is parsed back out of `pzbench`'s own
-output, scoped to that capture's profile block, so it cannot disagree with the report
-beside it.
+## License
 
-Logs live in `~/Zomboid/Logs/`. Two traps, both of which have already cost time:
-
-- PZ **rotates the previous run** into `Logs/logs_<timestamp>/` on launch, so the log
-  you want is usually in a subfolder, not loose in `Logs/`.
-- **PZ wipes its own log at ~10 MB, mid-session, with no backup.** Not rotation.
-  Read out of `zombie/core/logger/ZLogger` in `projectzomboid.jar` (42.21.0):
-
-  ```java
-  static final long s_maxSizeKo = 10000;
-
-  void checkSizeUnsafe() {
-      if (this.file.length() / 1024L > s_maxSizeKo) recreateLogFileUnsafe();
-  }
-  void recreateLogFileUnsafe() {
-      this.outputStreams.file.close();
-      this.file = new File(LoggerManager.getLogFilePath(this.name));
-      this.outputStreams.file = new PrintStream(this.file);   // truncates
-  }
-  ```
-
-  It fires at **10,241,024 bytes** exactly — integer division, so the first length
-  whose `length/1024` exceeds 10000 — then reopens a `PrintStream` on the *same
-  path*, which truncates it. Everything written earlier is destroyed while the game
-  is still running. The 3h58m session of 2026-11-04 15:23 left 214 lines covering its
-  last 6m20s; the first 3h52m were gone.
-
-  **There is nothing to configure.** `s_maxSizeKo` is `static final` — a compile-time
-  constant, with no system property, no launch flag and no `debuglog.cfg` key behind
-  it. `console.txt` is a separate `ZLogger` with its own 10 MB budget, so it wipes at
-  a different moment and by luck covered 811 stat lines of that session against
-  DebugLog's 39 — useful, but not a fix.
-
-  **Cutting log volume is not a way out either.** In steady state **82% of the bytes
-  are Viewpoint's own stat line** — 4.8 KB per sample, which is exactly the data
-  worth keeping. Silencing every other channel buys 18%, moving the cap from 4.7 to
-  5.7 hours, and Viewpoint has no key to trim the line (all 566 checked).
-
-  So **`pztail.py` copies the bytes out as they are written** and survives the
-  truncate. Run it before a long session:
-
-  ```
-  python pztail.py              # follow the live log, Ctrl-C to stop
-  python pztail.py --console    # also follow console.txt
-  python pztail.py --once       # one catch-up pass over what is there now
-  ```
-
-  Captures are append-only in `captures/`, and `pzbench.py` reads them directly. The
-  truncate detection is tested two ways — a plain truncate, and a truncate that
-  refills *past* the old offset inside one poll interval, which a size comparison
-  alone would miss and append into the middle of a fresh file. A 256-byte anchor
-  check catches that one.
-
-`pzbench.py` separates **pipeline-build** frames from **steady state** on purpose. The
-frame that hung the game was a build frame of 2,678 ms; folding that into a median
-hides both the stall and the real frame cost.
-
-## Safety built into `pzpreset.py`
-
-Three failure modes, all silent if unguarded:
-
-1. **Refuses to run while the game is running.** Both files are rewritten on exit, so
-   a mid-session edit is lost — and you would conclude the setting did nothing.
-   Viewpoint's own file header says the same: *"Edit it by hand only with the game
-   closed."*
-2. **Preserves CRLF and key order.** Load-and-dump would reorder 566 keys and drop the
-   header, making every future diff useless. Edits are line-oriented.
-3. **An unknown key is a hard error.** A typo would otherwise apply cleanly, change
-   nothing, and read as "that setting makes no difference".
-
-Every write backs up first to `backups/`, timestamped; `--restore` puts one back
-(and backs up the current file on the way).
-
-## Presets
-
-| Preset | Target | What |
-|---|---|---|
-| `00-baseline-*` | both | snapshot taken before any change — the way back |
-| `01-restore-cheap` | viewpoint | spend the headroom: lens flare, far shadows, headlight shadows, occlusion medium |
-| `02-mainthread` | options | `maxActiveRagdolls` 60→20, `uiRenderFPS` 120→60 |
-| `03-sky-and-light` | viewpoint | **reserve.** `bounceLight`, `cloudSteps` — both land in the most expensive pass |
-
-`01` and `02` applied 2026-11-04 14:50; both verified to have changed exactly their
-intended lines and nothing else. Not yet benched.
-
-## What this harness cannot see, and the day it mattered
-
-**Every metric in here is client-side. None of them can see a server.** On 2026-11-11
-a multiplayer session was unplayable — actions not registering, a car that stopped
-dead, a death to a horde — while this harness reported the best numbers it had ever
-produced: main frame 6.07 ms, 165 fps, zero slow frames, zero evictions, GC idle. The
-client was flawless and the game was broken.
-
-The server's simulation tick had collapsed from ~10/s to **0.2/s**, about 2.5 seconds
-per tick, for twelve minutes. `pzbench` cannot detect that and never will; a clean
-report is not evidence that the game plays well.
-
-What the client log *can* contribute is the trigger and the corroboration:
-
-| per minute | collapse (2026-11-11 09:39) |
-|---|---|
-| `remembered chunks` | 499 → 14,010 over 25 min |
-| `zombies loaded` | 29 → 196 → 410 (cap) |
-| `EquipPacket.set get invalid arguments` | 51 |
-| `player is not found` | 34 |
-| main thread frame | **unchanged at 6.07 ms** |
-
-`remembered chunks` is the useful column and it had never been read before: the cause
-was the **rate new map area is entered**, not zombie population (sandbox was Normal).
-The per-minute sync-error counts are the client-side fingerprint of a stalled server,
-and they are the right thing to grep for when the game feels wrong but the frame time
-does not move.
-
-Root cause was found server-side by thread dump — a mod's `OnTick` handler draining an
-uncapped queue of loaded containers — and fixed by capping it. The after: **7.65 ticks/s
-minimum under five times the loading rate**, with `EquipPacket` failures and
-`player is not found` at **zero** across a 20-minute run. The residual hitch under
-continuous fast travel is vanilla Java chunk loading and is not tunable.
-
-**The rule this leaves behind:** when the symptom is *delay* rather than *stutter*,
-measure the other end first. Stutter is a frame-time problem and lives here. Delay is
-a simulation-rate problem and does not.
-
-## The client frame time was the refresh interval, not a measurement
-
-Found 2026-11-11, after three sessions had already been compared on it.
-
-The display is **165 Hz**. The ceiling was set three times over: `vsync=true` and
-`frameRate=165` in `options.ini`, and `viewpoint-frame-caps.properties` carrying no
-`game` line, which its own header says means "the monitor's refresh rate".
-
-| session | min | median | p90−p10 | on the 6.06 ms floor | over 6.50 ms |
-|---|---|---|---|---|---|
-| 11-04, before the heap fix | 7.18 | 9.36 | **5.07 ms** | 0% | 100% |
-| 11-11 08-56 | **6.06** | 6.16 | 1.73 ms | 47.3% | 30.5% |
-| 11-11 10-31 | **6.06** | 6.10 | **0.27 ms** | 69.8% | 5.8% |
-| 11-11 11-09 | **6.06** | 6.30 | 1.50 ms | 37.6% | 36.6% |
-
-**Not one sample below 6.06 ms in any session after the heap fix**, in all three to the
-hundredth, where 165 Hz is 6.0606 ms. That is a hard floor, not the fast end of a
-distribution. At the floor the accounted main-thread work is `cache 0.46 far 0.09
-snapshot 1.50` ≈ 2.05 ms of a 6.07 ms frame, with `GPU 0.63 frames behind (at most 1)`:
-the main thread spends about 4 ms waiting on the present rather than working.
-
-Three consequences, all of which had already been acted on:
-
-- **`LIMITER: MAIN THREAD` on those runs means *limited by the present*.** The main
-  thread is simply the thread that blocks on the swap. It is not a statement about
-  main-thread work.
-- **The PZO comparison was "no change visible at the cap", not "no change".** The
-  verdict was right; the reason given for it was weaker than stated. A median that
-  cannot move is not evidence that nothing moved.
-- **The heap result is untouched.** The 11-04 session had no samples anywhere near the
-  cap and a 5.07 ms band, and the verification rested on GC cycle counts and a 3,635 MiB
-  settled heap — neither of which is clamped.
-
-What survives a cap, and is therefore still worth reading from the three sessions: the
-**per-pass GPU ms** (GPU timer queries), eviction counts, the heap, the slow-frame log,
-and the **share of frames that miss the cap** — which ran 30.5% / 5.8% / 36.6% while the
-medians spanned 0.20 ms.
-
-`pzbench.cap()` now detects this and refuses to compare two ceilings; `pzconfig.py`
-takes the ceiling off. The check that the uncap worked is the floor moving below
-6.06 ms, not either script reporting success.
-
-**The same trap, caught earlier in someone else's log and missed here.** It was flagged
-to the host lane on 2026-11-11 — their frame time was pinned flat at 33.33 ms by
-Viewpoint's `graphics.frameGeneration`, making the significance test meaningless — while
-this machine's own log was clamped in a milder form the whole time. A flat signal is
-easier to see in a log you are reading for the first time than in one you have been
-quoting for a week.
-
-## Open
-
-In priority order.
-
-0. **Uncap first — `python pzconfig.py --bench`.** Prerequisite for 1 and 2, not a
-   separate task. Capped, both land inside a 0.10 ms window and read as nothing.
-1. **Bench `02-mainthread`** (applied 2026-11-04, never measured). Main-thread side, so
-   it can actually move the limiter. Use the 4–5 minute protocol, uncapped — a
-   main-thread change is exactly what a frame-time cap hides.
-2. **Spend the GPU headroom — at least 1.5 ms of it, and probably more.** GPU median
-   runs **4.51–4.73 ms** against the 6.06 ms cap. That gap is real and spendable, but it
-   is a **lower bound**: the frame time it is measured against is a ceiling, so the true
-   headroom is unknown until a run is uncapped. A headroom-to-resolution ratio taken
-   against a capped frame time divides one clamped number by another and means nothing,
-   however large it comes out.
-
-   **The vanilla options cannot spend it — they are already at maximum.** See
-   *Two index conventions in one options file* below; the 0s in `options.ini` mean High,
-   not off. The one vanilla graphics option genuinely turned down is
-   `bPerfReflections=false`.
-
-   **Viewpoint's shader pack is where the floor actually is.** 13 of its 68
-   `pack.trueweathers.*` keys are `false`, and all six keys that `01-restore-cheap` and
-   `03-sky-and-light` target still hold their 2026-11-04 baseline values — so
-   `01-restore-cheap` was written and never applied, and the headroom has never been
-   spent at all.
-
-   **This needs no A/B** — the stat line attributes GPU ms per pass, so one run prices
-   every feature at once. Per-pass costs are GPU timer queries and stay valid under a cap,
-   which makes this the one open item that could have been worked the whole time. Top
-   passes measured: `gbuffer` 1.29 ms (28.5%), `sky+light` 1.10 ms (24.2%), `post+taa`
-   0.59 ms; `air`, `weather` and `outlines` sit at 0.00 ms. **A key does not necessarily
-   map to the pass that shares its name**: the `occlusion` pass already costs 0.45 ms
-   while `pack.trueweathers.occlusion` is `false`, so that pass is the base pack's own
-   work.
-
-   `04-high-viewpoint` + `04-high-options` go deliberately over budget — fidelity keys on,
-   taste keys (`motionBlur`, `filmGrain`, `depthOfField`, `nebula`, `fftWaves`) left off —
-   so the per-pass table can be read and then scaled down. Going high first is the method:
-   cost is only attributable to a setting that is actually costing something, whereas from
-   the floor every addition reads as zero until the budget is crossed and then they all
-   read at once.
-
-   One unverified value in that preset: `occlusionQuality=medium`. `low` is live and
-   `medium` is carried from `01-restore-cheap`, but the accepted set is not documented in
-   any file on disk. If the occlusion pass does not move, suspect a rejected value before
-   suspecting the setting.
-3. **Reduce what competes for the GPU memory budget.** Measured 2026-11-11 during play:
-   PZ holds 3,933 MB and **other processes hold 3,005 MB** — `dwm` 1,735 MB, then
-   Steam/Epic/Battle.net/Samsung Magician/Edge/Code/terminals. Evictions fire across
-   **45–76% card occupancy, median 67%** (8,262 of 12,282 MiB) because Windows sizes each
-   process's budget against the others, not because 12 GB is full. Quote the range or
-   the median, not the low end — at 45% occupancy the card looks almost empty, which
-   makes the budget mechanism sound stranger than it is.
-
-   **Ruled out 2026-11-11 on Tyler's call, and the arithmetic agrees.** The available
-   win is ~490 MB against roughly 4 GB of headroom, about 12%, in exchange for changing
-   how the machine gets used while playing. That is not a trade worth making, and a
-   tuning lever that requires closing the launchers you actually use is not a lever. The
-   eviction-stall problem stands open; this was the wrong instrument for it. The baseline
-   of **0.21–0.32 eviction events per minute** remains the number any future attempt
-   measures against.
-4. **`textureCompression=true` — keep it, deliberately.** It arrived as residue, not a
-   decision: the pre-PZO value was `false`, MPOptimizer enforced `Enabled` mid-session on
-   2026-11-11 at 09:43, and the change outlived the mod. But compression lowers VRAM
-   pressure, and VRAM eviction is the measured stall source above, so the value is right
-   even though nobody chose it. Resolved as a keep rather than reverted as residue — the
-   right value and a trustworthy provenance are different things, and only the first one
-   affects frame time. It still must be declared whenever a run is compared against
-   anything from before 2026-11-11.
-
-**Ruled out, so it does not get proposed again: Viewpoint's own memory pools.**
-`model packs` peaks at 122/128 and sits ≥95% full in 30% of frames, which looks like
-eviction pressure. It is not: evictions land in those frames at **×0.88**, slightly
-*less* than chance over 519 samples. Raising the pool caps would cost VRAM for nothing.
-The first cut of that test read 65 of 65 evictions "in a frame where a pool was full"
-and was vacuous — `sound files` sits at 122/128 in **100%** of frames, so the predicate
-was always true. A condition that is never false cannot be evidence.
-
-Lower priority, unchanged:
-
-- **No clean before/after exists for `01`/`02`.** They were applied immediately after
-  the only profiled run, so the pre-change state was never captured under control.
-  Recoverable with `--apply 00-baseline-viewpoint` / `00-baseline-options` if a true A
-  is ever wanted; probably not worth it now that the baseline is re-measured.
-- **`AdvancedAnimator$1.visitFileFailed` threw 11 exceptions at startup.** Unrelated to
-  the hang, never investigated.
+[AGPL-3.0](LICENSE).

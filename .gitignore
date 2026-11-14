@@ -10,13 +10,11 @@ __pycache__/
 /captures/*
 !/captures/.gitkeep
 
-# Generated benchmark reports and pzauto's bookkeeping. Derived from captures,
-# which are themselves ignored -- regenerate with `pzauto.py --once`. INDEX.md
-# is kept, because the one-line-per-session trend is the part worth reading in
-# six months and it is small.
+# Generated benchmark reports, pzauto's bookkeeping and its INDEX.md. Derived from
+# captures, which are themselves ignored -- regenerate with `pzauto.py --once` --
+# and they describe one PC's sessions, so they stay on that PC.
 /reports/*
 !/reports/.gitkeep
-!/reports/INDEX.md
 captures/*_process.csv
 
 # Zipped single-player saves from pzsavebackup.py (pztail --save-backups). They are
