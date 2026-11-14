@@ -321,10 +321,16 @@ window rather than the session. Summing the deltas: **13 events** in the 13-47 s
 where `max()` said 4. The morning session is 14, not 3. Every eviction rate quoted from a
 maximum is low by roughly a factor of three.
 
-**`st:` is not a wall clock.** The console lines carry `st:` where the DebugLog carries a
-timestamp, and solving one against the other looks like it should date the console
-warnings. It does not: `st` resets to 0, and the regression gives a 23,000-second spread
-over 6,174 anchors. Any time derived that way is fiction.
+**`st:` IS a wall clock, once the zeros are dropped.** The console lines carry `st:` where
+the DebugLog carries a timestamp. Measured 2026-11-14 over the 13-47 capture: 5,006 lines
+read `st:0`, every one of them before the first nonzero reading, and across the other
+6,725 lines wall time minus `st` is constant to ±2 ms and `st` never runs backwards. So
+it is milliseconds from an arbitrary origin (6h25m at the first reading), and a console
+line's time is its `st` plus one offset read from any stamped DebugLog line of the same
+session. A regression that keeps the `st:0` lines gets a 23,000-second spread, which is
+what an earlier pass here took as proof that the field was meaningless. Whether `st`
+survives a quit to menu and reload inside one process is untested; that session loaded
+once.
 
 **A clock skew needs one reference, not two readings.** Reading each machine's clock and
 subtracting measures the gap between two *moments*, not between two clocks.
