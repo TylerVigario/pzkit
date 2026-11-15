@@ -36,6 +36,7 @@ python pzconfig.py --bench | --play | --show                 # uncapped bench vs
 python pzproc.py   [--report CSV]                            # client handles/GDI over a session
 python pzsavebackup.py                                       # zip the newest single-player save
 uv run --script pzserverstats.py                             # server JVM heap/GC/safepoints
+python pzlinkcheck.py [<jar> ...]                            # Java mod calls a game update broke
 ```
 
 Every script explains itself in its docstring, including why it exists and what it
