@@ -30,6 +30,7 @@ Written against Build 42.21 and 42.22. `pztail`, `pzsavebackup`, `pzproc` and
 ```
 python pztail.py   [--console] [--server] [--save-backups]   # keep a log the game would wipe
 python pzbench.py  [--from-load] <log> [<log> ...]           # profile, hitches, compare runs
+python pzmodprof.py <log> [<log> ...]                        # which mods' Lua took the time (Mod Profiler)
 python pzauto.py   [--once]                                  # report each finished session
 python pzpreset.py --list | --diff P | --apply P             # change settings reproducibly
 python pzconfig.py --bench | --play | --show                 # uncapped bench vs play profile
